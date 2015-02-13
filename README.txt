@@ -11,3 +11,4 @@ Pieper, S., Rosen, J., & Zeltzer, D. (1992), "Interactive graphics for plastic s
 
 Pieper, S., Laub, D., Rosen, J., (1995), "A Finite Element Model for Simulating Plastic Surgery", in Plastic and Reconstructive Surgery, Vol. 96, No. 5 (pp. 1100-1105).
 
+The code is made available for public review, but use of the code requires permission from Steve Pieper.
