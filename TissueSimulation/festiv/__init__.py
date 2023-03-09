@@ -8,5 +8,5 @@
 
 """
 
-import isomap
+from .isomap import *
 

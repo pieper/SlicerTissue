@@ -82,7 +82,7 @@ class gridder:
 
   def interpolate(self,nodes,array,r,s,t):
     ans = 0.
-    for i in xrange(20):
+    for i in range(20):
       if not nodes[i]:
         continue
       ans = ans + array[i] * self._iso20.h(r,s,t,i)
@@ -105,7 +105,7 @@ class gridder:
         el.load_xyz_arrays(x_array, y_array, z_array)
 
       # now iterate on faces and add points and polygons
-      for face in xrange(6):
+      for face in range(6):
         if el._shared_faces[face]:
           continue
         steps = self._steps[face]
@@ -132,11 +132,11 @@ class gridder:
         # add the points for this face
         pis = [] # point indices for added points
         r = r_start
-        for rcount in xrange(0,steps+1,rstep):
+        for rcount in range(0,steps+1,rstep):
           s = s_start
-          for scount in xrange(0,steps+1,sstep):
+          for scount in range(0,steps+1,sstep):
             t = t_start
-            for tcount in xrange(0,steps+1,tstep):
+            for tcount in range(0,steps+1,tstep):
               x = self.interpolate(el._nodes,x_array,r,s,t)
               y = self.interpolate(el._nodes,y_array,r,s,t)
               z = self.interpolate(el._nodes,z_array,r,s,t)
@@ -147,8 +147,8 @@ class gridder:
           r = r + r_inc
 
         # add the polygons that form this face
-        for col in xrange(steps):
-          for row in xrange(steps):
+        for col in range(steps):
+          for row in range(steps):
             ll = (col     * (steps+1)) + row
             ul = (col     * (steps+1)) + row + 1
             ur = ((col+1) * (steps+1)) + row + 1

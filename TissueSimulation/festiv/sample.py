@@ -34,7 +34,7 @@ element = festiv.element.element20()
 s._elements.append(element)
 
 # create the nodes and put them at the default location
-for i in xrange(20):
+for i in range(20):
   node = festiv.node.node()
   node._p = iso20.__unit_nodes__[i]
   s._nodes.append( node )
@@ -47,7 +47,7 @@ for node in element.face_nodes(1):
 # make another element, offset in z
 element = festiv.element.element20()
 s._elements.append(element)
-for i in xrange(20):
+for i in range(20):
   node = festiv.node.node()
   node._p = iso20.__unit_nodes__[i] + numpy.array([0, 0, 4])
   s._nodes.append( node )

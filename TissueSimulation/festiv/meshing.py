@@ -32,14 +32,14 @@ def glue_faces(structure, from_el, from_face, to_el, to_face):
 
   faces = new_el.__faces__
   # link to the shared nodes - need to go opposite direction 
-  for i in xrange(8):
+  for i in range(8):
     from_node = from_el._nodes[ faces[from_face][8-i] ]  # uses wraparound
     new_el._nodes[ faces[0][i] ] = from_node
     to_node = to_el._nodes[ faces[to_face][8-i] ]  # uses wraparound
     new_el._nodes[ faces[1][i] ] = to_node
 
   # position middle nodes between corresponding face nodes
-  for i in xrange(4):
+  for i in range(4):
     node = festiv.node.node()
     new_el._nodes[16+i] = node
     p0 = new_el._nodes[i]._p

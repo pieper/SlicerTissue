@@ -52,24 +52,6 @@ class TissueSimulationWidget(ScriptedLoadableModuleWidget):
     # Layout within the dummy collapsible button
     parametersFormLayout = qt.QFormLayout(parametersCollapsibleButton)
 
-    #
-    # input volume selector
-    #
-    self.inputSelector = slicer.qMRMLNodeComboBox()
-    self.inputSelector.nodeTypes = ( ("vtkMRMLScalarVolumeNode"), "" )
-    self.inputSelector.addAttribute( "vtkMRMLScalarVolumeNode", "LabelMap", 0 )
-    self.inputSelector.selectNodeUponCreation = True
-    self.inputSelector.addEnabled = False
-    self.inputSelector.removeEnabled = False
-    self.inputSelector.noneEnabled = False
-    self.inputSelector.showHidden = False
-    self.inputSelector.showChildNodeTypes = False
-    self.inputSelector.setMRMLScene( slicer.mrmlScene )
-    self.inputSelector.setToolTip( "Pick the input to the algorithm." )
-
-    # TODO: make some more interface elements
-    # parametersFormLayout.addRow("Input Volume: ", self.inputSelector)
-
     # reload and run specific tests
     scenarios = ("OneElement",)
     for scenario in scenarios:
@@ -120,7 +102,7 @@ class TissueSimulationLogic(ScriptedLoadableModuleLogic):
       structure = festiv.structure.structure()
     self.structure = structure
     self.gridder = festiv.el_grid.gridder(self.structure)
-    self._updatingNodeFiducials = False
+    self._updatingNodeControlPoints = False
     self.fiducialList = None
     self.model = None
 
@@ -138,7 +120,7 @@ class TissueSimulationLogic(ScriptedLoadableModuleLogic):
 
   def updateModel(self):
     modelPoints = slicer.util.array(self.model.GetID())
-    if modelPoints == None:
+    if modelPoints is None:
       # older slicer without direct access to point arrays
       p = self.model.GetPolyData().GetPoints().GetData()
       modelPoints = vtk.util.numpy_support.vtk_to_numpy(p)
@@ -147,7 +129,7 @@ class TissueSimulationLogic(ScriptedLoadableModuleLogic):
     self.model.GetPolyData().GetPoints().GetData().Modified()
     self.model.GetPolyData().GetPoints().Modified()
 
-  def setFiducialListDisplay(self,fiducialList):
+  def setControlPointListDisplay(self,fiducialList):
     displayNode = fiducialList.GetDisplayNode()
     # TODO: pick appropriate defaults
     # 135,135,84
@@ -159,7 +141,7 @@ class TissueSimulationLogic(ScriptedLoadableModuleLogic):
     #displayNode.GetAnnotationTextDisplayNode().SetColor((1,1,0))
     displayNode.SetVisibility(True)
 
-  def createNodeFiducials(self,name='N'):
+  def createNodeControlPoints(self,name='N'):
     """Add a fiducial for each node in the structure
     """
 
@@ -168,9 +150,8 @@ class TissueSimulationLogic(ScriptedLoadableModuleLogic):
     slicer.mrmlScene.StartState(slicer.mrmlScene.BatchProcessState)
 
     # make the fiducial list if required
-    fiducialListNodeID = markupsLogic.AddNewFiducialNode(name,slicer.mrmlScene)
-    self.fiducialList = slicer.util.getNode(fiducialListNodeID)
-    self.setFiducialListDisplay(self.fiducialList)
+    self.fiducialList = markupsLogic.AddNewMarkupsNode("vtkMRMLMarkupsFiducialNode", name)
+    self.setControlPointListDisplay(self.fiducialList)
 
     # make this active so that the fids will be added to it
     markupsLogic.SetActiveListID(self.fiducialList)
@@ -179,38 +160,43 @@ class TissueSimulationLogic(ScriptedLoadableModuleLogic):
     # - index in fiducial list is equal to node index in _nodes list
     for node in self.structure._nodes:
       pu = node.pu()
-      self.fiducialList.AddFiducial(*pu)
-      fiducialIndex = self.fiducialList.GetNumberOfFiducials()-1
+      self.fiducialList.AddControlPoint(*pu)
+      fiducialIndex = self.fiducialList.GetNumberOfControlPoints()-1
 
-      self.fiducialList.SetNthFiducialLabel(fiducialIndex, name)
+      self.fiducialList.SetNthControlPointLabel(fiducialIndex, name)
       nodeFixed = node._fixed.max() > 0
-      self.fiducialList.SetNthFiducialSelected(fiducialIndex, not nodeFixed)
-      self.fiducialList.SetNthMarkupLocked(fiducialIndex, not nodeFixed)
+      self.fiducialList.SetNthControlPointSelected(fiducialIndex, not nodeFixed)
+      self.fiducialList.SetNthControlPointLocked(fiducialIndex, not nodeFixed)
 
     # observe list for changes
     self.fiducialList.AddObserver( self.fiducialList.PointModifiedEvent, 
-      lambda caller,event: self.onFiducialMoved(caller))
+      lambda caller,event: self.onControlPointMoved(caller))
     self.fiducialList.AddObserver( self.fiducialList.PointEndInteractionEvent, 
-        lambda caller,event: self.onFiducialEndMoving(caller))
+        lambda caller,event: self.onControlPointEndMoving(caller))
 
-    originalActiveList = slicer.util.getNode(originalActiveListID)
-    if originalActiveList:
+    try:
+      originalActiveList = slicer.util.getNode(originalActiveListID)
       markupsLogic.SetActiveListID(originalActiveList)
+    except slicer.util.MRMLNodeNotFoundException:
+      pass
     slicer.mrmlScene.EndState(slicer.mrmlScene.BatchProcessState)
 
-  def onFiducialMoved(self,fiducialList):
+  def onControlPointMoved(self,fiducialList):
     """Callback when fiducialList's point has been changed."""
-    if self._updatingNodeFiducials:
+    if self._updatingNodeControlPoints:
       return
     slicer.mrmlScene.StartState(slicer.mrmlScene.BatchProcessState)
-    nodeCount = self.fiducialList.GetNumberOfFiducials()
+    nodeCount = self.fiducialList.GetNumberOfControlPoints()
     for nodeIndex in range(nodeCount):
       node = self.structure._nodes[nodeIndex]
       point = [0,]*3
-      self.fiducialList.GetNthFiducialPosition(nodeIndex,point)
+      self.fiducialList.GetNthControlPointPosition(nodeIndex,point)
       node._u = numpy.array(point) - node._p
     self.updateFromStructure()
     slicer.mrmlScene.EndState(slicer.mrmlScene.BatchProcessState)
+
+  def onControlPointEndMoving(caller,event):
+    pass
 
   def updateFromStructure(self):
     # update structure (TODO: save decomposed matrix in structure.py)
@@ -221,13 +207,13 @@ class TissueSimulationLogic(ScriptedLoadableModuleLogic):
     self.updateModel()
 
     # refresh node fiducials
-    self._updatingNodeFiducials = True
-    nodeCount = self.fiducialList.GetNumberOfFiducials()
+    self._updatingNodeControlPoints = True
+    nodeCount = self.fiducialList.GetNumberOfControlPoints()
     for nodeIndex in range(nodeCount):
       node = self.structure._nodes[nodeIndex]
       pu = node.pu()
-      self.fiducialList.SetNthFiducialPosition(nodeIndex,*pu)
-    self._updatingNodeFiducials = False
+      self.fiducialList.SetNthControlPointPosition(nodeIndex,*pu)
+    self._updatingNodeControlPoints = False
 
 
 class TissueSimulationTest(ScriptedLoadableModuleTest):
@@ -281,11 +267,13 @@ class TissueSimulationTest(ScriptedLoadableModuleTest):
     import festiv.meshing
     import festiv.el_grid
 
-    reload(festiv.structure)
-    reload(festiv.element)
-    reload(festiv.node)
-    reload(festiv.meshing)
-    reload(festiv.el_grid)
+    import importlib
+
+    importlib.reload(festiv.structure)
+    importlib.reload(festiv.element)
+    importlib.reload(festiv.node)
+    importlib.reload(festiv.meshing)
+    importlib.reload(festiv.el_grid)
 
     # make a structure
     logic = TissueSimulationLogic()
@@ -297,7 +285,7 @@ class TissueSimulationTest(ScriptedLoadableModuleTest):
     s._elements.append(element)
 
     # create the nodes and make the element 40mm on a side
-    for i in xrange(20):
+    for i in range(20):
       node = festiv.node.node()
       node._p = numpy.array(iso20.__unit_nodes__[i]) * 20
       s._nodes.append( node )
@@ -329,7 +317,7 @@ class TissueSimulationTest(ScriptedLoadableModuleTest):
     # now visualize
     #
     logic.createModel()
-    logic.createNodeFiducials()
+    logic.createNodeControlPoints()
 
     slicer.tissueLogic = logic
 

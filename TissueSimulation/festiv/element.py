@@ -60,7 +60,7 @@ class element20:
     self._name = name
     # nodes that define this element
     self._nodes = []
-    for i in xrange(20):
+    for i in range(20):
       self._nodes.append(False)
     # material properties for this element
     self._youngs_modulus = 1.e6
@@ -87,7 +87,7 @@ class element20:
     max = bbnodes[0].pu()
     for node in bbnodes[1:]:
       pu = node.pu()
-      for i in xrange(3):
+      for i in range(3):
         if pu[i] < min[i]:
           min[i] = pu[i]
         if pu[i] > max[i]:
@@ -96,7 +96,7 @@ class element20:
 
 
   def load_xyz_arrays(self, x_array, y_array, z_array):
-    for i in xrange(20):
+    for i in range(20):
       if not self._nodes[i]:
         x_array[i] = y_array[i] = z_array[i] = 0.
       else:
@@ -105,7 +105,7 @@ class element20:
         z_array[i] = self._nodes[i]._p[2]
 
   def load_disp_xyz_arrays(self, x_array, y_array, z_array):
-    for i in xrange(20):
+    for i in range(20):
       if not self._nodes[i]:
         x_array[i] = y_array[i] = z_array[i] = 0.
       else:
@@ -140,7 +140,7 @@ class element20:
   def calculate_J(self, x_array, y_array, z_array, r, s, t, jac, jinv):
     """find jacobian, inverse, and determinant"""
     iso20 = festiv.isomap.iso20()
-    for i in xrange(20):
+    for i in range(20):
       if self._nodes[i]:
         dhdr = iso20.dhdr(r,s,t,i)
         dhds = iso20.dhds(r,s,t,i)
@@ -165,7 +165,7 @@ class element20:
   def calculate_H_T(self, x_array, y_array, z_array, r, s, t, H_T):
     """Calculate the H_T element displacement matrix for the current element at the point r,s,t"""
     iso20 = festiv.isomap.iso20()
-    for i in xrange(20):
+    for i in range(20):
       H_T[   i,0] = iso20.h(r,s,t,i)
       H_T[20+i,1] = iso20.h(r,s,t,i)
       H_T[40+i,2] = iso20.h(r,s,t,i)
@@ -183,7 +183,7 @@ class element20:
     iso20 = festiv.isomap.iso20()
 
     # fill hhat
-    for i in xrange(20):
+    for i in range(20):
       self._hhat[0,i] = iso20.dhdr(r,s,t,i)
       self._hhat[1,i] = iso20.dhds(r,s,t,i)
       self._hhat[2,i] = iso20.dhdt(r,s,t,i)
@@ -193,7 +193,7 @@ class element20:
     self._gamma = self._jinv * self._hhat
 
     # now fill Bm
-    for i in xrange(20):
+    for i in range(20):
       Bm[0,     i] = self._gamma[0,i] 
       Bm[1,20 + i] = self._gamma[1,i] 
       Bm[2,40 + i] = self._gamma[2,i] 
@@ -228,9 +228,9 @@ class element20:
     #TODO: set active nodes based on node list
     
     self.fill_C(real_C)
-    for r in xrange(3):
-      for s in xrange(3):
-        for t in xrange(3):
+    for r in range(3):
+      for s in range(3):
+        for t in range(3):
           qp = self.__quadpoints__
           detj = self.calculate_B( x_array, y_array, z_array, qp[r][0], qp[s][0], qp[t][0], real_B )
           kmtmp = real_B.T * real_C * real_B
@@ -248,9 +248,9 @@ class element20:
 
     # calculate the nodal equivelent forces for the gravity load
     # by integrating of the quadrature points
-    for r in xrange(3):
-      for s in xrange(3):
-        for t in xrange(3):
+    for r in range(3):
+      for s in range(3):
+        for t in range(3):
           self._jac[:] = 0.
           self._jinv[:] = 0.
           qp = self.__quadpoints__
@@ -259,9 +259,9 @@ class element20:
           Re_g_tmp = H_T * g.T
           Re_g += detj * qp[r][1] * qp[s][1] * qp[2][1] * Re_g_tmp # should multiply by mass density rho(r,s,t)
     # copy the node loads back into the nodes
-    for i in xrange(20):
+    for i in range(20):
       if self._nodes[i]:
-        for dof in xrange(3):
+        for dof in range(3):
           self._nodes[i]._r[dof] = Re_g[20*dof + i]
 
 

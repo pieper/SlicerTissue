@@ -178,16 +178,16 @@ class iso20:
 def _test():
   i = iso20()
   # known values at center of cube
-  for n in xrange(8):
+  for n in range(8):
     assert i.h(0,0,0, n) == -.25
-  for n in xrange(9,20):
+  for n in range(9,20):
     assert i.h(0,0,0, n) == .25
   # interpolation function n is 1 at node n's coordinates 
   # and 0 at all other interpolation functions are 0
-  for n in xrange(0,20):
+  for n in range(0,20):
     r,s,t = i.__unit_nodes__[n]
     assert i.h(r,s,t, n) == 1.
-    for nn in xrange(0,20):
+    for nn in range(0,20):
       if nn != n:
         assert i.h(r,s,t, nn) == 0.
 

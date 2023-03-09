@@ -83,11 +83,11 @@ class structure:
   def add_Km_to_K(self, element):
     """Copy element stiffness matrix into structure's global stiffness matrix""" 
     nsize = self._nodes.__len__()
-    for ncount in xrange(20):
+    for ncount in range(20):
       if not element._nodes[ncount]:
         continue
       nli = element._nodes[ncount]._node_list_index
-      for i in xrange(20):
+      for i in range(20):
         if not element._nodes[i]:
           continue
         other_n = element._nodes[i]
@@ -131,7 +131,7 @@ class structure:
     nsize = len(self._nodes)
     ncount = 0
     for node in self._nodes:
-      for dof in xrange(3):
+      for dof in range(3):
         i = nsize*dof + ncount
         if not node._fixed[dof]:
           # not fixed: apply load to right hand side vector
@@ -156,7 +156,7 @@ class structure:
     nsize = len(self._nodes)
     ncount = 0
     for node in self._nodes:
-      for dof in xrange(3):
+      for dof in range(3):
         if not node._fixed[dof]:
           i = nsize*dof + ncount
           node._u[dof] = self._U[i]
