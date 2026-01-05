@@ -64,7 +64,7 @@ class SlicerViewer():
         return self.paused
 
 
-    def set_model(self, model):
+    def set_model(self, model, particle_material):
         self.model = model
 
         self.vtk_points = vtk.vtkPoints()
@@ -75,6 +75,20 @@ class SlicerViewer():
         polydata.SetPoints(self.vtk_points)
 
         vertices = vtk.vtkCellArray()
+
+        material_scalars = vtk.vtkIntArray()
+        material_scalars.SetName("Material")
+        material_scalars.SetNumberOfComponents(1)
+
+        # Create a scalar for each particle based on its material type
+        material_ids = particle_material.numpy()
+        for i in range(polydata.GetNumberOfPoints()):
+            material_id = material_ids[i]
+            material_scalars.InsertNextValue(material_id)
+
+        polydata.GetPointData().SetScalars(material_scalars)
+
+
         for i in range(polydata.GetNumberOfPoints()):
             vertices.InsertNextCell(1)
             vertices.InsertCellPoint(i)
@@ -97,8 +111,23 @@ class SlicerViewer():
             pointsNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode")
             pointsNode.SetName("points")
             pointsNode.CreateDefaultDisplayNodes()
+            displayNode = pointsNode.GetDisplayNode()
+            displayNode.SetScalarVisibility(True)
+            displayNode.SetActiveScalarName("Material")
+            displayNode.SetAndObserveColorNodeID("vtkMRMLColorTableNodeLabels")
 
         pointsNode.SetAndObserveMesh(glyph3D.GetOutput())
+
+        # Set up color mapping for materials
+        displayNode = pointsNode.GetDisplayNode()
+        colorNode = displayNode.GetColorNode()
+        if colorNode:
+            colorNode.SetColor(1, 0.1, 0.1, 0.2) # Inactive
+            colorNode.SetColor(2, 0.7, 0.6, 0.4) # Sand
+            colorNode.SetColor(3, 0.75, 0.75, 0.8) # Snow
+            colorNode.SetColor(4, 0.4, 0.25, 0.25) # Mud
+
+
         self.glyph3D = glyph3D
         self.pointsNode = pointsNode
 
@@ -144,9 +173,9 @@ class Example:
         snow_particles = wp.array(snow_particles, dtype=int, device=self.model.device)
         mud_particles = wp.array(mud_particles, dtype=int, device=self.model.device)
 
-        self.model.particle_ke = 1.0e25
+        self.model.particle_ke = 1.0e5
         self.model.particle_kd = 0.0
-        self.model.particle_mu = 0.5
+        self.model.particle_mu = 0.1
 
         mpm_options = SolverImplicitMPM.Options()
         mpm_options.voxel_size = options.voxel_size
@@ -160,14 +189,14 @@ class Example:
         # some properties like elastic stiffness, damping, can be adjusted directly on the model,
         # but not all yet. here we directly adjust the MPM model's material parameters
 
-        mpm_model.material_parameters.yield_pressure[snow_particles].fill_(1.0e10)
-        mpm_model.material_parameters.yield_stress[snow_particles].fill_(1.0e2)
-        mpm_model.material_parameters.tensile_yield_ratio[snow_particles].fill_(0.1)
+        mpm_model.material_parameters.yield_pressure[snow_particles].fill_(1.0e20)
+        mpm_model.material_parameters.yield_stress[snow_particles].fill_(1.0e20)
+        mpm_model.material_parameters.tensile_yield_ratio[snow_particles].fill_(0.9)
         mpm_model.material_parameters.friction[snow_particles].fill_(0.0)
         mpm_model.material_parameters.hardening[snow_particles].fill_(1.0)
 
-        mpm_model.material_parameters.yield_pressure[mud_particles].fill_(1.0e10)
-        mpm_model.material_parameters.yield_stress[mud_particles].fill_(3.0e2)
+        mpm_model.material_parameters.yield_pressure[mud_particles].fill_(1.0e20)
+        mpm_model.material_parameters.yield_stress[mud_particles].fill_(3.0e20)
         mpm_model.material_parameters.tensile_yield_ratio[mud_particles].fill_(1.0)
         mpm_model.material_parameters.hardening[mud_particles].fill_(2.0)
         mpm_model.material_parameters.friction[mud_particles].fill_(0.0)
@@ -191,14 +220,16 @@ class Example:
         self.solver.enrich_state(self.state_1)
 
         # Assign different colors to each particle type
+        # Also assign material IDs to particles
         self.particle_colors = wp.full(
             shape=self.model.particle_count, value=wp.vec3(0.1, 0.1, 0.2), device=self.model.device
         )
-        self.particle_colors[sand_particles].fill_(wp.vec3(0.7, 0.6, 0.4))
-        self.particle_colors[snow_particles].fill_(wp.vec3(0.75, 0.75, 0.8))
-        self.particle_colors[mud_particles].fill_(wp.vec3(0.4, 0.25, 0.25))
+        self.particle_material = wp.ones(shape=self.model.particle_count, dtype=int, device=self.model.device)
+        self.particle_material[sand_particles].fill_(2)
+        self.particle_material[snow_particles].fill_(3)
+        self.particle_material[mud_particles].fill_(4)
 
-        self.viewer.set_model(self.model)
+        self.viewer.set_model(self.model, self.particle_material)
 
     def simulate(self):
         for _ in range(self.sim_substeps):
