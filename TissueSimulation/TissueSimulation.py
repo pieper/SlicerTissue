@@ -53,13 +53,12 @@ class TissueSimulationWidget(ScriptedLoadableModuleWidget):
     parametersFormLayout = qt.QFormLayout(parametersCollapsibleButton)
 
     # reload and run specific tests
-    scenarios = ("OneElement",)
+    scenarios = ("OneElement", "Newton", "MPM")
     for scenario in scenarios:
       button = qt.QPushButton("Reload and Test %s" % scenario)
-      self.reloadAndTestButton.toolTip = "Reload this module and then run the %s self test." % scenario
+      button.toolTip = "Reload this module and then run the %s self test." % scenario
       parametersFormLayout.addWidget(button)
-      #button.connect('clicked()', lambda s=scenario: self.onReloadAndTest(scenario=s))
-      button.connect('clicked()', self.onReloadAndTest)
+      button.connect('clicked()', lambda s=scenario: self.onReloadAndTest(scenario=s))
 
     #
     # Apply Button
@@ -107,13 +106,13 @@ class TissueSimulationLogic(ScriptedLoadableModuleLogic):
     self.model = None
 
   def createModel(self):
-    self.gridder._steps = (4,)*6
+    self.gridder._steps = (3,)*6
     self.gridder.surface_grid()
     # TODO
     # load directly to slicer node
     surfacePath = slicer.app.temporaryPath + 'oneElement.vtk'
     self.gridder.write_grid(surfacePath)
-    loaded,self.model = slicer.util.loadModel(surfacePath, returnNode=True)
+    self.model = slicer.util.loadModel(surfacePath)
     displayNode = self.model.GetDisplayNode()
     displayNode.SetBackfaceCulling(0)
     displayNode.SetEdgeVisibility(1)
@@ -149,7 +148,7 @@ class TissueSimulationLogic(ScriptedLoadableModuleLogic):
     originalActiveListID = markupsLogic.GetActiveListID()
     slicer.mrmlScene.StartState(slicer.mrmlScene.BatchProcessState)
 
-    # make the fiducial list if required
+    # make the pointList list if required
     self.fiducialList = markupsLogic.AddNewMarkupsNode("vtkMRMLMarkupsFiducialNode", name)
     self.setControlPointListDisplay(self.fiducialList)
 
@@ -169,9 +168,9 @@ class TissueSimulationLogic(ScriptedLoadableModuleLogic):
       self.fiducialList.SetNthControlPointLocked(fiducialIndex, not nodeFixed)
 
     # observe list for changes
-    self.fiducialList.AddObserver( self.fiducialList.PointModifiedEvent, 
+    self.fiducialList.AddObserver( self.fiducialList.PointModifiedEvent,
       lambda caller,event: self.onControlPointMoved(caller))
-    self.fiducialList.AddObserver( self.fiducialList.PointEndInteractionEvent, 
+    self.fiducialList.AddObserver( self.fiducialList.PointEndInteractionEvent,
         lambda caller,event: self.onControlPointEndMoving(caller))
 
     try:
@@ -232,7 +231,15 @@ class TissueSimulationTest(ScriptedLoadableModuleTest):
     """Run as few or as many tests as needed here.
     """
     self.setUp()
-    self.test_TissueSimulation1()
+    if scenario is None or scenario == "OneElement":
+      self.test_TissueSimulation1()
+    elif scenario == "Newton":
+      self.test_NewtonPackage()
+    elif scenario == "MPM":
+      self.test_MPMSimulation()
+    else:
+      self.delayDisplay(f"Unknown test scenario: {scenario}", 3000)
+      self.fail(f"Unknown test scenario: {scenario}")
 
   def test_TissueSimulation1(self):
     """ Ideally you should have several levels of tests.  At the lowest level
@@ -295,7 +302,7 @@ class TissueSimulationTest(ScriptedLoadableModuleTest):
     for node in element.face_nodes(1):
       node._fixed.fill(1)
 
-    if 0:
+    if False:
       # move all the top nodes up by 5
       for node in element.face_nodes(0):
         node._u.fill(0)
@@ -303,16 +310,17 @@ class TissueSimulationTest(ScriptedLoadableModuleTest):
         node._fixed.fill(1)
 
     # grab and move a node at the top corner by a fixed offset
-    node = s._elements[0]._nodes[0]
-    node._u = numpy.array([10,10,10])
-    node._fixed.fill(1)
+    if True:
+        node = s._elements[0]._nodes[0]
+        node._u = numpy.array([10,10,10])
+        node._fixed.fill(1)
 
 
     # create the stiffness matrix
     s.make_K()
     s.apply_bc()
     s.solve()
-    
+
     #
     # now visualize
     #
@@ -320,5 +328,209 @@ class TissueSimulationTest(ScriptedLoadableModuleTest):
     logic.createNodeControlPoints()
 
     slicer.tissueLogic = logic
+
+    self.delayDisplay('Test passed!')
+
+  def test_NewtonPackage(self):
+    """
+    Test if 'newton' package can be installed and imported.
+    """
+    self.delayDisplay("Starting newton package test")
+
+    try:
+      import newton
+      self.delayDisplay("'newton' package is already available.")
+    except ImportError:
+      self.delayDisplay("Attempting to install 'newton-krylov' from PyPI...")
+      import slicer.util
+      slicer.util.pip_install('newton-krylov')
+      try:
+        import newton
+        self.delayDisplay("Successfully installed and imported 'newton' package.")
+      except ImportError:
+        self.delayDisplay("Failed to import 'newton' after installation.", 3000)
+        self.fail("Could not import 'newton' package after pip_install.")
+    self.delayDisplay('Test passed!')
+
+  def test_MPMSimulation(self):
+    """
+    Test if 'mpm' simulation can run by copying essential code
+    from the mpm.py experiment.
+    """
+    self.delayDisplay("Starting MPM simulation test")
+
+    try:
+      import warp as wp
+      import newton
+      from newton.solvers import SolverImplicitMPM
+      self.delayDisplay("'warp' and 'newton' packages are already available.")
+    except ImportError:
+      self.delayDisplay("Attempting to install 'warp-lang' and 'newton-krylov' from PyPI...")
+      import slicer.util
+      try:
+        slicer.util.pip_install("warp-lang")
+        slicer.util.pip_install("newton-krylov")
+        import warp as wp
+        import newton
+        from newton.solvers import SolverImplicitMPM
+        self.delayDisplay("Successfully installed and imported 'warp' and 'newton' packages.")
+      except Exception as e:
+        self.delayDisplay(f"Failed to install or import required packages: {e}", 3000)
+        self.fail(f"Could not install/import packages for MPM test: {e}")
+
+    import slicer
+
+    # Essential code from mpm.py experiment copied here for the test
+
+    class SlicerViewer():
+        """Minimal viewer for non-interactive testing"""
+        def __init__(self):
+            self.running = True
+            self.paused = False
+        def is_running(self): return self.running
+        def is_paused(self): return self.paused
+        def set_model(self, model): pass
+        def begin_frame(self, sim_time): pass
+        def log_points(self, name, points, radii, colors, hidden): pass
+        def end_frame(self): pass
+        def close(self): pass
+
+    class Example:
+        def __init__(self, viewer, options):
+            self.fps = 60.0
+            self.frame_dt = 1.0 / self.fps
+            self.sim_time = 0.0
+            self.sim_substeps = 1
+            self.sim_dt = self.frame_dt / self.sim_substeps
+            self.viewer = viewer
+
+            builder = newton.ModelBuilder()
+            sand_particles, snow_particles, mud_particles = self.emit_particles(builder, voxel_size=options.voxel_size)
+
+            builder.add_ground_plane()
+            self.model = builder.finalize()
+
+            sand_particles = wp.array(sand_particles, dtype=int, device=self.model.device)
+            snow_particles = wp.array(snow_particles, dtype=int, device=self.model.device)
+            mud_particles = wp.array(mud_particles, dtype=int, device=self.model.device)
+
+            self.model.particle_ke = 1.0e15
+            self.model.particle_kd = 0.0
+            self.model.particle_mu = 0.5
+
+            mpm_options = SolverImplicitMPM.Options()
+            mpm_options.voxel_size = options.voxel_size
+            mpm_options.tolerance = options.tolerance
+            mpm_options.max_iterations = options.max_iterations
+
+            mpm_model = SolverImplicitMPM.Model(self.model, mpm_options)
+
+            mpm_model.material_parameters.yield_pressure[snow_particles].fill_(2.0e4)
+            mpm_model.material_parameters.yield_stress[snow_particles].fill_(1.0e3)
+            mpm_model.material_parameters.tensile_yield_ratio[snow_particles].fill_(0.05)
+            mpm_model.material_parameters.friction[snow_particles].fill_(0.1)
+            mpm_model.material_parameters.hardening[snow_particles].fill_(10.0)
+
+            mpm_model.material_parameters.yield_pressure[mud_particles].fill_(1.0e10)
+            mpm_model.material_parameters.yield_stress[mud_particles].fill_(3.0e2)
+            mpm_model.material_parameters.tensile_yield_ratio[mud_particles].fill_(1.0)
+            mpm_model.material_parameters.hardening[mud_particles].fill_(2.0)
+            mpm_model.material_parameters.friction[mud_particles].fill_(0.0)
+
+            mpm_model.notify_particle_material_changed()
+
+            self.solver = SolverImplicitMPM(mpm_model, mpm_options)
+
+            self.state_0 = self.model.state()
+            self.state_1 = self.model.state()
+
+            self.solver.enrich_state(self.state_0)
+            self.solver.enrich_state(self.state_1)
+
+            self.viewer.set_model(self.model)
+
+        def simulate(self):
+            for _ in range(self.sim_substeps):
+                self.state_0.clear_forces()
+                self.solver.step(self.state_0, self.state_1, None, None, self.sim_dt)
+                self.solver.project_outside(self.state_1, self.state_1, self.sim_dt)
+                self.state_0, self.state_1 = self.state_1, self.state_0
+
+        def step(self):
+            self.simulate()
+            self.sim_time += self.frame_dt
+
+        @staticmethod
+        def _spawn_particles(builder: newton.ModelBuilder, voxel_size, bounds_lo, bounds_hi, density, flags):
+            particles_per_cell = 3
+            res = numpy.array(
+                numpy.ceil(particles_per_cell * (bounds_hi - bounds_lo) / voxel_size),
+                dtype=int,
+            )
+
+            cell_size = (bounds_hi - bounds_lo) / res
+            cell_volume = numpy.prod(cell_size)
+            radius = numpy.max(cell_size) * 0.5
+            mass = numpy.prod(cell_volume) * density
+
+            begin_id = len(builder.particle_q)
+            builder.add_particle_grid(
+                pos=wp.vec3(bounds_lo),
+                rot=wp.quat_identity(),
+                vel=wp.vec3(0.0),
+                dim_x=res[0] + 1,
+                dim_y=res[1] + 1,
+                dim_z=res[2] + 1,
+                cell_x=cell_size[0],
+                cell_y=cell_size[1],
+                cell_z=cell_size[2],
+                mass=mass,
+                jitter=2.0 * radius,
+                radius_mean=radius,
+                flags=flags,
+            )
+
+            end_id = len(builder.particle_q)
+            return numpy.arange(begin_id, end_id, dtype=int)
+
+        @classmethod
+        def emit_particles(cls, builder: newton.ModelBuilder, voxel_size: float):
+            cls._spawn_particles(
+                builder, voxel_size, bounds_lo=numpy.array([-0.5, -0.5, 0.0]),
+                bounds_hi=numpy.array([0.5, 0.5, 0.25]), density=1000.0, flags=0,
+            )
+            sand_particles = cls._spawn_particles(
+                builder, voxel_size, bounds_lo=numpy.array([0.25, -0.5, 0.5]),
+                bounds_hi=numpy.array([0.75, 0.5, 0.75]), density=2500.0, flags=newton.ParticleFlags.ACTIVE,
+            )
+            snow_particles = cls._spawn_particles(
+                builder, voxel_size, bounds_lo=numpy.array([-0.75, -0.5, 0.5]),
+                bounds_hi=numpy.array([-0.25, 0.5, 0.75]), density=300, flags=newton.ParticleFlags.ACTIVE,
+            )
+            mud_particles = cls._spawn_particles(
+                builder, voxel_size, bounds_lo=numpy.array([-0.5, -0.25, 1.0]),
+                bounds_hi=numpy.array([0.5, 0.25, 1.5]), density=1000.0, flags=newton.ParticleFlags.ACTIVE,
+            )
+            return sand_particles, snow_particles, mud_particles
+
+    class Options():
+        max_iterations = 25
+        tolerance = 1.0e-6
+        voxel_size = 0.15
+
+    try:
+      viewer = SlicerViewer()
+      options = Options()
+      example = Example(viewer, options)
+      # run for a few steps to ensure it doesn't crash
+      self.delayDisplay("Running simulation for 10 steps...")
+      for i in range(10):
+        example.step()
+        slicer.app.processEvents() # Keep UI responsive
+    except Exception as e:
+      import traceback
+      traceback.print_exc()
+      self.delayDisplay(f"Failed to run MPM simulation: {e}", 3000)
+      self.fail(f"Failed to run MPM simulation: {e}")
 
     self.delayDisplay('Test passed!')
