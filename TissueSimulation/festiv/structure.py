@@ -156,7 +156,7 @@ class structure:
       for dof in range(3):
         if not node._fixed[dof]:
           i = nsize*dof + ncount
-          node._u[dof] = self._U[i]
+          node._u[dof] = self._U[i,0]
       ncount = ncount + 1
 
 def _test():

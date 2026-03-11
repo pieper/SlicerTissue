@@ -262,7 +262,7 @@ class element20:
     for i in range(20):
       if self._nodes[i]:
         for dof in range(3):
-          self._nodes[i]._r[dof] = Re_g[20*dof + i]
+          self._nodes[i]._r[dof] = Re_g[20*dof + i, 0]
 
 
   def face_nodes(self, face):
