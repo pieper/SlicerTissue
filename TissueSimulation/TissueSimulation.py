@@ -234,6 +234,7 @@ class TissueSimulationLogic(ScriptedLoadableModuleLogic):
 
     # 2. Visualize the results in Slicer
     self.createModel()
+    self.updateModel()  # overwrite LPS→RAS transform from VTK load
     self.createNodeControlPoints()
 
     # 3. Make the logic accessible for interactive debugging from the console
@@ -360,6 +361,7 @@ class TissueSimulationTest(ScriptedLoadableModuleTest):
     # now visualize
     #
     logic.createModel()
+    logic.updateModel()  # overwrite LPS→RAS transform from VTK load
     logic.createNodeControlPoints()
 
     slicer.tissueLogic = logic
