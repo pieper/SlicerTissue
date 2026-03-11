@@ -654,8 +654,10 @@ class StackComparison:
 
     def create_views(self):
         self.festiv.createModel()
+        self.festiv.updateModel()  # overwrite LPS→RAS transform from VTK load
         self.festiv.createControlPoints()
         self.warp.createModel()
+        self.warp.updateModel()    # overwrite LPS→RAS transform from VTK load
         self.warp.createControlPoints()
 
 
@@ -663,6 +665,7 @@ class StackComparison:
 #  Main
 # ======================================================================
 def main():
+    import time
     print('=' * 60)
     print('Compare 3-element stacks: festiv (linear) vs warp.fem (NH)')
     print('=' * 60)

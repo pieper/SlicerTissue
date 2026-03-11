@@ -53,7 +53,7 @@ class TissueSimulationWidget(ScriptedLoadableModuleWidget):
     parametersFormLayout = qt.QFormLayout(parametersCollapsibleButton)
 
     # reload and run specific tests
-    scenarios = ("OneElement", "GluedBeam", "TwoElements", "Slab", "Subdivision", "Newton", "MPM")
+    scenarios = ("OneElement", "GluedBeam", "TwoElements", "Slab", "Subdivision", "Stack3Compare", "Newton", "MPM")
     for scenario in scenarios:
       button = qt.QPushButton("Reload and Test %s" % scenario)
       button.toolTip = "Reload this module and then run the %s self test." % scenario
@@ -266,6 +266,8 @@ class TissueSimulationTest(ScriptedLoadableModuleTest):
       self.test_TissueSimulation_Slab()
     elif scenario == "Subdivision":
       self.test_TissueSimulation_Subdivision()
+    elif scenario == "Stack3Compare":
+      self.test_Stack3Compare()
     elif scenario == "Newton":
       self.test_NewtonPackage()
     elif scenario == "MPM":
@@ -363,6 +365,22 @@ class TissueSimulationTest(ScriptedLoadableModuleTest):
     slicer.tissueLogic = logic
 
     self.delayDisplay('Test passed!')
+
+  def test_Stack3Compare(self):
+    """Side-by-side 3-element stack: festiv (linear elastic) vs warp.fem (Neo-Hookean).
+    Runs the stack3_compare.py script which creates interactive mirrored boundary conditions.
+    """
+    self.delayDisplay("Starting Stack3 Compare test", 100)
+
+    import os
+    scriptPath = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                              "NewtonTissue", "examples", "stack3_compare.py")
+    if not os.path.exists(scriptPath):
+      self.fail(f"stack3_compare.py not found at {scriptPath}")
+
+    exec(open(scriptPath, encoding='utf-8').read())
+
+    self.delayDisplay('Stack3 Compare test passed!')
 
   def test_NewtonPackage(self):
     """
