@@ -664,67 +664,64 @@ class StackComparison:
 # ======================================================================
 #  Main
 # ======================================================================
-def main():
-    import time
-    print('=' * 60)
-    print('Compare 3-element stacks: festiv (linear) vs warp.fem (NH)')
-    print('=' * 60)
+import time as _time
 
-    slicer.mrmlScene.Clear(0)
+print('=' * 60)
+print('Compare 3-element stacks: festiv (linear) vs warp.fem (NH)')
+print('=' * 60)
 
-    t0 = time.time()
-    comp = StackComparison()
+slicer.mrmlScene.Clear(0)
 
-    # Verify festiv mesh
-    n_nodes = len(comp.festiv.structure._nodes)
-    n_expected = NUM_ELEMENTS * 20 - (NUM_ELEMENTS - 1) * 8
-    print(f'\n  Festiv nodes: {n_nodes} (expected {n_expected})')
+_t0 = _time.time()
+comp = StackComparison()
 
-    # Check Jacobian signs
-    for ei, el in enumerate(comp.festiv.structure._elements):
-        x = numpy.matrix(numpy.zeros([20, 1]))
-        y = numpy.matrix(numpy.zeros([20, 1]))
-        z = numpy.matrix(numpy.zeros([20, 1]))
-        el.load_xyz_arrays(x, y, z)
-        jac = numpy.matrix(numpy.zeros([3, 3]))
-        jinv = numpy.matrix(numpy.zeros([3, 3]))
-        detj = el.calculate_J(x, y, z, 0, 0, 0, jac, jinv)
-        print(f'  Element {ei} Jacobian det at center: {detj:.1f}')
+# Verify festiv mesh
+_n_nodes = len(comp.festiv.structure._nodes)
+_n_expected = NUM_ELEMENTS * 20 - (NUM_ELEMENTS - 1) * 8
+print(f'\n  Festiv nodes: {_n_nodes} (expected {_n_expected})')
 
-    # Check shared faces
-    for ei, el in enumerate(comp.festiv.structure._elements):
-        shared = [i for i in range(6) if el._shared_faces[i]]
-        print(f'  Element {ei} shared faces: {shared}')
+# Check Jacobian signs
+for _ei, _el in enumerate(comp.festiv.structure._elements):
+    _x = numpy.matrix(numpy.zeros([20, 1]))
+    _y = numpy.matrix(numpy.zeros([20, 1]))
+    _z = numpy.matrix(numpy.zeros([20, 1]))
+    _el.load_xyz_arrays(_x, _y, _z)
+    _jac = numpy.matrix(numpy.zeros([3, 3]))
+    _jinv = numpy.matrix(numpy.zeros([3, 3]))
+    _detj = _el.calculate_J(_x, _y, _z, 0, 0, 0, _jac, _jinv)
+    print(f'  Element {_ei} Jacobian det at center: {_detj:.1f}')
 
-    comp.create_views()
+# Check shared faces
+for _ei, _el in enumerate(comp.festiv.structure._elements):
+    _shared = [i for i in range(6) if _el._shared_faces[i]]
+    print(f'  Element {_ei} shared faces: {_shared}')
 
-    # Comparison
-    festiv_disp = numpy.array([n._u for n in comp.festiv.structure._nodes])
-    warp_disp = comp.warp.u_field.dof_values.numpy()
-    festiv_free = [i for i, n in enumerate(comp.festiv.structure._nodes)
-                   if n._fixed.max() == 0]
-    warp_free = [i for i in range(comp.warp.n_dof) if i not in comp.warp.bc_dofs]
-    festiv_max = max(numpy.linalg.norm(festiv_disp[i]) for i in festiv_free)
-    warp_max = max(numpy.linalg.norm(warp_disp[i]) for i in warp_free)
+comp.create_views()
 
-    print(f'\n  Festiv max free-node disp:  {festiv_max:.3f} mm')
-    print(f'  Warp.fem max free-node disp: {warp_max:.3f} mm')
-    if festiv_max > 0:
-        print(f'  NH strain stiffening: {(1 - warp_max/festiv_max)*100:.1f}% stiffer')
+# Comparison
+_festiv_disp = numpy.array([n._u for n in comp.festiv.structure._nodes])
+_warp_disp = comp.warp.u_field.dof_values.numpy()
+_festiv_free = [i for i, n in enumerate(comp.festiv.structure._nodes)
+               if n._fixed.max() == 0]
+_warp_free = [i for i in range(comp.warp.n_dof) if i not in comp.warp.bc_dofs]
+_festiv_max = max(numpy.linalg.norm(_festiv_disp[i]) for i in _festiv_free)
+_warp_max = max(numpy.linalg.norm(_warp_disp[i]) for i in _warp_free)
 
-    print(f'\n  Setup time: {time.time()-t0:.2f}s')
+print(f'\n  Festiv max free-node disp:  {_festiv_max:.3f} mm')
+print(f'  Warp.fem max free-node disp: {_warp_max:.3f} mm')
+if _festiv_max > 0:
+    print(f'  NH strain stiffening: {(1 - _warp_max/_festiv_max)*100:.1f}% stiffer')
 
-    slicer.stack_comp = comp
+print(f'\n  Setup time: {_time.time()-_t0:.2f}s')
 
-    slicer.app.layoutManager().setLayout(
-        slicer.vtkMRMLLayoutNode.SlicerLayoutOneUp3DView)
-    v = slicer.app.layoutManager().threeDWidget(0).threeDView()
-    v.resetFocalPoint()
+slicer.stack_comp = comp
 
-    print('\n  Drag blue corner (festiv) or red corner (warp.fem)')
-    print('  Both stacks update with same BC for direct comparison')
-    print('  Object: slicer.stack_comp')
-    print('=' * 60)
+slicer.app.layoutManager().setLayout(
+    slicer.vtkMRMLLayoutNode.SlicerLayoutOneUp3DView)
+_v = slicer.app.layoutManager().threeDWidget(0).threeDView()
+_v.resetFocalPoint()
 
-
-main()
+print('\n  Drag blue corner (festiv) or red corner (warp.fem)')
+print('  Both stacks update with same BC for direct comparison')
+print('  Object: slicer.stack_comp')
+print('=' * 60)
