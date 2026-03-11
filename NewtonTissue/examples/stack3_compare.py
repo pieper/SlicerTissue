@@ -17,9 +17,13 @@ Usage (from Slicer Python console):
 
 import sys, os, numpy, vtk, time
 
-TISSUE_DIR   = '/Users/pieper/slicer/latest/SlicerTissue/NewtonTissue'
-FESTIV_DIR   = '/Users/pieper/slicer/latest/SlicerTissue/TissueSimulation'
-EXAMPLES_DIR = os.path.join(TISSUE_DIR, 'examples')
+# Compute paths relative to this script's location
+# Script is at: SlicerTissue/NewtonTissue/examples/stack3_compare.py
+_SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__)) if '__file__' in dir() else os.getcwd()
+_NEWTON_DIR  = os.path.dirname(_SCRIPT_DIR) if os.path.basename(_SCRIPT_DIR) == 'examples' else _SCRIPT_DIR
+_SLICER_TISSUE_DIR = os.path.dirname(_NEWTON_DIR)
+EXAMPLES_DIR = os.path.join(_NEWTON_DIR, 'examples')
+FESTIV_DIR   = os.path.join(_SLICER_TISSUE_DIR, 'TissueSimulation')
 
 for p in [FESTIV_DIR, EXAMPLES_DIR]:
     if p not in sys.path:

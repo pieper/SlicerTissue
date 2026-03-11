@@ -381,6 +381,7 @@ class TissueSimulationTest(ScriptedLoadableModuleTest):
       self.fail(f"stack3_compare.py not found at {scriptPath}")
 
     g = globals().copy()
+    g['__file__'] = scriptPath
     exec(open(scriptPath, encoding='utf-8').read(), g)
 
     self.delayDisplay('Stack3 Compare test passed!')
