@@ -691,6 +691,9 @@ class TissueSimulationTest(ScriptedLoadableModuleTest):
     importlib.reload(festiv.isomap)
 
     # --- Setup the Simulation ---
+    # Use position-based node sharing: create nodes by physical position
+    # and deduplicate via a dict keyed by rounded coordinates.
+    # This avoids error-prone face-to-face index mapping entirely.
 
     # 1. Initialize the logic and the main structure
     logic = TissueSimulationLogic()
@@ -698,45 +701,39 @@ class TissueSimulationTest(ScriptedLoadableModuleTest):
     iso20 = festiv.isomap.iso20()
     elementSize = 20.0
 
-    # 2. Create the base (bottom) element and all its nodes
-    baseElement = festiv.element.element20()
-    s._elements.append(baseElement)
-    for i in range(20):
-      node = festiv.node.node()
-      node._p = numpy.array(iso20.__unit_nodes__[i]) * elementSize
-      s._nodes.append(node)
-      baseElement._nodes[i] = node
+    # 2. Create both elements with position-based node sharing
+    node_dict = {}  # (round(x), round(y), round(z)) -> node
+    for k in range(2):  # 2 elements stacked in z
+      center_z = (k - 0.5) * 2 * elementSize  # -20, +20
+      element = festiv.element.element20()
+      s._elements.append(element)
+      for i in range(20):
+        ux, uy, uz = iso20.__unit_nodes__[i]
+        px = ux * elementSize
+        py = uy * elementSize
+        pz = uz * elementSize + center_z
+        key = (round(px, 6), round(py, 6), round(pz, 6))
+        if key not in node_dict:
+          node = festiv.node.node()
+          node._p = numpy.array([px, py, pz])
+          s._nodes.append(node)
+          node_dict[key] = node
+        element._nodes[i] = node_dict[key]
 
-    # 3. Create the top element, sharing nodes with the base element's top face
-    topElement = festiv.element.element20()
-    s._elements.append(topElement)
+    # Mark shared faces between elements
+    el_node_sets = [set(id(n) for n in el._nodes if n) for el in s._elements]
+    for ei, el in enumerate(s._elements):
+      for face_idx in range(6):
+        face_node_ids = set(id(el._nodes[ni]) for ni in el.__faces__[face_idx][:8] if el._nodes[ni])
+        for ej, other_set in enumerate(el_node_sets):
+          if ei != ej and face_node_ids.issubset(other_set):
+            el._shared_faces[face_idx] = 1
+            break
 
-    # Map the top face of the base element to the bottom face of the top element
-    # This creates the compatible mesh by sharing nodes.
-    # NOTE: The node order must be reversed on one face to create a non-inverted element.
-    # A simple list reversal is not enough due to the specific ordering of corner and mid-edge nodes.
-    # We must map them explicitly.
-    # Base Top Face (0) node indices: (0, 11, 3, 10, 2, 9, 1, 8)
-    # Top Bottom Face (1) node indices: (4, 12, 5, 13, 6, 14, 7, 15)
-    # Correct reversed mapping:
-    base_to_top_map = {
-        0: 6, 11: 13, 3: 5, 10: 12, 2: 4, 9: 15, 1: 7, 8: 14
-    }
-    for base_node_idx, top_node_idx in base_to_top_map.items():
-        shared_node = baseElement._nodes[base_node_idx]
-        topElement._nodes[top_node_idx] = shared_node
+    baseElement = s._elements[0]
+    topElement = s._elements[1]
 
-
-    # Create the remaining 12 (non-shared) nodes for the top element
-    z_offset = elementSize * 2
-    for i in range(20):
-      if not topElement._nodes[i]: # If node is not already shared
-        node = festiv.node.node()
-        node._p = (numpy.array(iso20.__unit_nodes__[i]) * elementSize) + numpy.array([0, 0, z_offset])
-        s._nodes.append(node)
-        topElement._nodes[i] = node
-
-    # 4. Set boundary conditions
+    # 3. Set boundary conditions
     for node in baseElement.face_nodes(1): # Fix bottom face of base element
       node._fixed.fill(1)
 
