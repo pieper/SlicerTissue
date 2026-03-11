@@ -146,17 +146,17 @@ class element20:
         dhds = iso20.dhds(r,s,t,i)
         dhdt = iso20.dhdt(r,s,t,i)
 
-        jac[0,0] += x_array[i]*dhdr
-        jac[1,0] += x_array[i]*dhds
-        jac[2,0] += x_array[i]*dhdt
+        jac[0,0] += x_array[i,0]*dhdr
+        jac[1,0] += x_array[i,0]*dhds
+        jac[2,0] += x_array[i,0]*dhdt
 
-        jac[0,1] += y_array[i]*dhdr
-        jac[1,1] += y_array[i]*dhds
-        jac[2,1] += y_array[i]*dhdt
+        jac[0,1] += y_array[i,0]*dhdr
+        jac[1,1] += y_array[i,0]*dhds
+        jac[2,1] += y_array[i,0]*dhdt
 
-        jac[0,2] += z_array[i]*dhdr
-        jac[1,2] += z_array[i]*dhds
-        jac[2,2] += z_array[i]*dhdt
+        jac[0,2] += z_array[i,0]*dhdr
+        jac[1,2] += z_array[i,0]*dhds
+        jac[2,2] += z_array[i,0]*dhdt
 
     jinv[:] = numpy.linalg.inv(jac)
     detj = numpy.linalg.det(jac)
