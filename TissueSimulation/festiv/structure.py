@@ -67,6 +67,8 @@ class structure:
 
   def establish_variables(self):
     """Initialize variables for solving the current configuration of the structure"""
+    if not self._dirty:
+      return
     N = 3 * self._nodes.__len__()
     self._N = N
     self._K = numpy.matrix( numpy.zeros([N,N]) )
@@ -78,6 +80,7 @@ class structure:
     for node in self._nodes:
       node._node_list_index = i
       i = i + 1
+    self._dirty = False
 
 
   def add_Km_to_K(self, element):
@@ -93,30 +96,23 @@ class structure:
         other_n = element._nodes[i]
         other_nli = other_n._node_list_index
 
-        # copy x row
-        self._K[ 0       + nli, 0       + other_nli ] += element._Km[ 0  + ncount, 0  + i ]
-        self._K[ 0       + nli, nsize   + other_nli ] += element._Km[ 0  + ncount, 20 + i ]
-        self._K[ 0       + nli, 2*nsize + other_nli ] += element._Km[ 0  + ncount, 40 + i ]
-
-        # copy y row
-        self._K[ nsize   + nli, 0       + other_nli ] += element._Km[ 20 + ncount, 0  + i ]
-        self._K[ nsize   + nli, nsize   + other_nli ] += element._Km[ 20 + ncount, 20 + i ]
-        self._K[ nsize   + nli, 2*nsize + other_nli ] += element._Km[ 20 + ncount, 40 + i ]
-
-        # copy z row
-        self._K[ 2*nsize + nli, 0       + other_nli ] += element._Km[ 40 + ncount, 0  + i ]
-        self._K[ 2*nsize + nli, nsize   + other_nli ] += element._Km[ 40 + ncount, 20 + i ]
-        self._K[ 2*nsize + nli, 2*nsize + other_nli ] += element._Km[ 40 + ncount, 40 + i ]
+        # Correctly map local element DOFs to global DOFs
+        for dof_row in range(3):
+          global_row = dof_row * nsize + nli
+          local_row_offset = dof_row * 20
+          for dof_col in range(3):
+            global_col = dof_col * nsize + other_nli
+            local_col_offset = dof_col * 20
+            self._K[global_row, global_col] += element._Km[local_row_offset + ncount, local_col_offset + i]
 
 
   def make_K(self):
     """create the global stiffness matrix""" 
-    self._dirty = True
     self.establish_variables()
+    self._K.fill(0)
     for element in self._elements:
       element.calculate_stiffness()
       self.add_Km_to_K(element)
-    self._dirty = False
 
 
   def apply_gravity(self, g):
@@ -128,6 +124,7 @@ class structure:
 
   def apply_bc(self):
     """Apply the loading and displacement boundary condtions to the current K matrix"""
+    self.establish_variables()
     nsize = len(self._nodes)
     ncount = 0
     for node in self._nodes:
@@ -146,13 +143,13 @@ class structure:
 
   def solve(self):
     """Solve for the displacements and copy them back to the nodes"""
+    self.establish_variables()
     self._U = numpy.linalg.solve(self._K, self._R)
-    self._Kinv = numpy.linalg.inv(self._K)
-    # self._U = numpy.linalg.solve(self._K, self._R)
+    #self._Kinv = numpy.linalg.inv(self._K)
     self.updateNodes()
 
   def updateNodes(self):
-    self._U = self._Kinv * self._R
+    #self._U = self._Kinv * self._R
     nsize = len(self._nodes)
     ncount = 0
     for node in self._nodes:

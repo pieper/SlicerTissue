@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.swp
+*.un~
+*~
+.DS_Store
+.pytest_cache/
+.claude/
+.mcp.json
+*.code-workspace
+Experiments/

@@ -53,12 +53,12 @@ class TissueSimulationWidget(ScriptedLoadableModuleWidget):
     parametersFormLayout = qt.QFormLayout(parametersCollapsibleButton)
 
     # reload and run specific tests
-    scenarios = ("OneElement", "Newton", "MPM")
+    scenarios = ("OneElement", "GluedBeam", "TwoElements", "Slab", "Subdivision", "Newton", "MPM")
     for scenario in scenarios:
       button = qt.QPushButton("Reload and Test %s" % scenario)
       button.toolTip = "Reload this module and then run the %s self test." % scenario
-      parametersFormLayout.addWidget(button)
-      button.connect('clicked()', lambda s=scenario: self.onReloadAndTest(scenario=s))
+      parametersFormLayout.addRow(button)
+      button.connect('clicked()', lambda scenario=scenario: self.onReloadAndTest(scenario=scenario))
 
     #
     # Apply Button
@@ -137,6 +137,9 @@ class TissueSimulationLogic(ScriptedLoadableModuleLogic):
     displayNode.SetGlyphTypeFromString('Sphere3D')
     displayNode.SetColor((0.6,0.6,0.2))
     displayNode.SetSelectedColor((1,1,0))
+    displayNode.SetActiveColor((1,.5,0))
+    unconstrained = slicer.vtkMRMLMarkupsFiducialDisplayNode.SnapModeUnconstrained
+    displayNode.SetSnapMode(unconstrained)
     #displayNode.GetAnnotationTextDisplayNode().SetColor((1,1,0))
     displayNode.SetVisibility(True)
 
@@ -200,7 +203,7 @@ class TissueSimulationLogic(ScriptedLoadableModuleLogic):
   def updateFromStructure(self):
     # update structure (TODO: save decomposed matrix in structure.py)
     self.structure.apply_bc()
-    #self.structure.solve()
+    self.structure.solve()
     self.structure.updateNodes()
 
     self.updateModel()
@@ -213,6 +216,28 @@ class TissueSimulationLogic(ScriptedLoadableModuleLogic):
       pu = node.pu()
       self.fiducialList.SetNthControlPointPosition(nodeIndex,*pu)
     self._updatingNodeControlPoints = False
+
+  def run(self, structure=None):
+    """
+    Runs the full simulation pipeline: matrix assembly, solve, and visualization.
+    If a structure is passed, it will be used for the simulation. Otherwise,
+    the logic's internal structure is used.
+    """
+    if structure:
+      self.structure = structure
+      self.gridder = festiv.el_grid.gridder(self.structure)
+
+    # 1. Create the stiffness matrix, apply boundary conditions, and solve
+    self.structure.make_K()
+    self.structure.apply_bc()
+    self.structure.solve()
+
+    # 2. Visualize the results in Slicer
+    self.createModel()
+    self.createNodeControlPoints()
+
+    # 3. Make the logic accessible for interactive debugging from the console
+    slicer.tissueLogic = self
 
 
 class TissueSimulationTest(ScriptedLoadableModuleTest):
@@ -233,6 +258,14 @@ class TissueSimulationTest(ScriptedLoadableModuleTest):
     self.setUp()
     if scenario is None or scenario == "OneElement":
       self.test_TissueSimulation1()
+    elif scenario == "GluedBeam":
+      self.test_TissueSimulation2()
+    elif scenario == "TwoElements":
+      self.test_TissueSimulation3()
+    elif scenario == "Slab":
+      self.test_TissueSimulation_Slab()
+    elif scenario == "Subdivision":
+      self.test_TissueSimulation_Subdivision()
     elif scenario == "Newton":
       self.test_NewtonPackage()
     elif scenario == "MPM":
@@ -534,3 +567,278 @@ class TissueSimulationTest(ScriptedLoadableModuleTest):
       self.fail(f"Failed to run MPM simulation: {e}")
 
     self.delayDisplay('Test passed!')
+
+  def test_TissueSimulation2(self):
+    """ Test a beam made of three elements stacked and glued together
+    """
+
+    self.delayDisplay("Starting the Glued Beam test", 100)
+
+    import festiv
+    import festiv.structure
+    import festiv.element
+    import festiv.node
+    import festiv.meshing
+    import festiv.el_grid
+    import festiv.isomap
+
+    import importlib
+
+    # Reload modules to pick up any changes
+    importlib.reload(festiv.structure)
+    importlib.reload(festiv.element)
+    importlib.reload(festiv.node)
+    importlib.reload(festiv.meshing)
+    importlib.reload(festiv.el_grid)
+    importlib.reload(festiv.isomap)
+
+    # --- Setup the Simulation ---
+
+    # 1. Initialize the logic and the main structure
+    logic = TissueSimulationLogic()
+    s = logic.structure
+    iso20 = festiv.isomap.iso20()
+    elementSize = 20.0
+
+    # 2. Create the base (bottom) element
+    baseElement = festiv.element.element20()
+    s._elements.append(baseElement)
+    for i in range(20):
+      node = festiv.node.node()
+      # Position nodes for a 40x40x40 cube centered at (0,0,0)
+      node._p = numpy.array(iso20.__unit_nodes__[i]) * elementSize
+      s._nodes.append(node)
+      baseElement._nodes[i] = node
+
+    # 3. Create the top element, positioned above the base element
+    topElement = festiv.element.element20()
+    s._elements.append(topElement)
+    # The gap between elements should be the size of one element
+    z_offset = elementSize * 2 
+    for i in range(20):
+      node = festiv.node.node()
+      node._p = (numpy.array(iso20.__unit_nodes__[i]) * elementSize) + numpy.array([0, 0, z_offset])
+      s._nodes.append(node)
+      topElement._nodes[i] = node
+
+    # 4. Use glue_faces to create a middle element that connects the base and top
+    #    This glues the bottom face (1) of the top element to the top face (0) of the base element
+    festiv.meshing.glue_faces(s, topElement, 1, baseElement, 0)
+
+    # 5. Set boundary conditions
+    #    - Fix the bottom face of the base element
+    for node in baseElement.face_nodes(1):
+      node._fixed.fill(1)
+
+    #    - Apply a displacement to a top corner of the top element
+    displacedNode = topElement._nodes[0]
+    displacedNode._u = numpy.array([10, 10, 10])
+    displacedNode._fixed.fill(1)
+
+    # 6. Run the solver
+    s.make_K()
+    s.apply_bc()
+    s.solve()
+
+    # 7. Visualize the result in Slicer
+    logic.createModel()
+    logic.createNodeControlPoints()
+    slicer.tissueLogic = logic
+
+    self.delayDisplay('Glued Beam Test passed!')
+
+  def test_TissueSimulation3(self):
+    """ Test a two-element structure with a manually created compatible mesh by sharing nodes.
+    """
+
+    self.delayDisplay("Starting the Two-Element test", 100)
+
+    import festiv
+    import festiv.structure
+    import festiv.element
+    import festiv.node
+    import festiv.meshing
+    import festiv.el_grid
+    import festiv.isomap
+
+    import importlib
+
+    # Reload modules to pick up any changes
+    importlib.reload(festiv.structure)
+    importlib.reload(festiv.element)
+    importlib.reload(festiv.node)
+    importlib.reload(festiv.meshing)
+    importlib.reload(festiv.el_grid)
+    importlib.reload(festiv.isomap)
+
+    # --- Setup the Simulation ---
+
+    # 1. Initialize the logic and the main structure
+    logic = TissueSimulationLogic()
+    s = logic.structure
+    iso20 = festiv.isomap.iso20()
+    elementSize = 20.0
+
+    # 2. Create the base (bottom) element and all its nodes
+    baseElement = festiv.element.element20()
+    s._elements.append(baseElement)
+    for i in range(20):
+      node = festiv.node.node()
+      node._p = numpy.array(iso20.__unit_nodes__[i]) * elementSize
+      s._nodes.append(node)
+      baseElement._nodes[i] = node
+
+    # 3. Create the top element, sharing nodes with the base element's top face
+    topElement = festiv.element.element20()
+    s._elements.append(topElement)
+
+    # Map the top face of the base element to the bottom face of the top element
+    # This creates the compatible mesh by sharing nodes.
+    # NOTE: The node order must be reversed on one face to create a non-inverted element.
+    # A simple list reversal is not enough due to the specific ordering of corner and mid-edge nodes.
+    # We must map them explicitly.
+    # Base Top Face (0) node indices: (0, 11, 3, 10, 2, 9, 1, 8)
+    # Top Bottom Face (1) node indices: (4, 12, 5, 13, 6, 14, 7, 15)
+    # Correct reversed mapping:
+    base_to_top_map = {
+        0: 6, 11: 13, 3: 5, 10: 12, 2: 4, 9: 15, 1: 7, 8: 14
+    }
+    for base_node_idx, top_node_idx in base_to_top_map.items():
+        shared_node = baseElement._nodes[base_node_idx]
+        topElement._nodes[top_node_idx] = shared_node
+
+
+    # Create the remaining 12 (non-shared) nodes for the top element
+    z_offset = elementSize * 2
+    for i in range(20):
+      if not topElement._nodes[i]: # If node is not already shared
+        node = festiv.node.node()
+        node._p = (numpy.array(iso20.__unit_nodes__[i]) * elementSize) + numpy.array([0, 0, z_offset])
+        s._nodes.append(node)
+        topElement._nodes[i] = node
+
+    # 4. Set boundary conditions
+    for node in baseElement.face_nodes(1): # Fix bottom face of base element
+      node._fixed.fill(1)
+
+    displacedNode = topElement._nodes[0] # Displace a top corner of the top element
+    displacedNode._u = numpy.array([10, 10, 10])
+    displacedNode._fixed.fill(1)
+
+    # 5. Run the solver and visualize
+    logic.run(s)
+
+    self.delayDisplay('Two-Element Test passed!')
+
+  def test_TissueSimulation_Slab(self):
+    """ Test a multi-layer slab of tissue.
+    This test creates a 2x2x2 grid of elements with different material
+    properties to simulate soft and hard tissue layers, adapted from the
+    layer generation logic in the original CAPS system.
+    """
+
+    self.delayDisplay("Starting the Slab test", 100)
+
+    import festiv
+
+    import importlib
+
+    # Reload modules to pick up any changes
+    for module_name in ('structure', 'element', 'node', 'meshing', 'el_grid', 'isomap'):
+        importlib.reload(getattr(festiv, module_name))
+
+    # --- Setup the Simulation ---
+
+    # 1. Initialize the logic and structure
+    logic = TissueSimulationLogic()
+    s = logic.structure
+
+    # 2. Define the slab geometry and material properties for each layer
+    grid_dims = (2, 2)  # A 2x2 grid of elements in the XY plane
+    element_size = (20.0, 20.0) # Each element is 20x20 units
+    layer_defs = [
+        {
+            'thickness': 20.0,
+            'youngs_modulus': 1.e4,  # Softer top layer
+            'poissons_ratio': 0.45
+        },
+        {
+            'thickness': 20.0,
+            'youngs_modulus': 1.e6,  # Stiffer bottom layer
+            'poissons_ratio': 0.3
+        }
+    ]
+
+    # 3. Create the layered grid
+    festiv.meshing.create_layered_grid(s, grid_dims, element_size, layer_defs)
+
+    # 4. Apply boundary conditions
+    # Fix all nodes on the bottom-most face of the entire slab
+    bottom_z = -sum(layer['thickness'] for layer in layer_defs)
+    for node in s._nodes:
+        if numpy.isclose(node._p[2], bottom_z):
+            node._fixed.fill(1)
+
+    # Displace a single node on the top surface
+    top_node = s._nodes[0] # This should be a corner node on the top surface
+    top_node._u = numpy.array([10, 10, 10])
+    top_node._fixed.fill(1)
+
+    # 5. Run the solver and visualize
+    logic.run(s)
+
+    self.delayDisplay('Slab Test passed!')
+
+  def test_TissueSimulation_Subdivision(self):
+    """
+    Tests the subdivision of a single 20-node element into eight smaller elements.
+    """
+
+    self.delayDisplay("Starting the Subdivision test", 10)
+
+    import festiv
+    import festiv.structure
+    import festiv.element
+    import festiv.node
+    import festiv.meshing
+    import festiv.el_grid
+    import festiv.isomap
+
+    import importlib
+
+    # Reload modules to pick up any changes
+    for module_name in ('structure', 'element', 'node', 'meshing', 'el_grid', 'isomap'):
+        importlib.reload(getattr(festiv, module_name))
+
+    # --- 1. Create a single parent element (similar to oneelement test) ---
+    parent_element = festiv.element.element20()
+    iso20 = festiv.isomap.iso20()
+
+    # Create the nodes for the parent element, 40mm on a side
+    for i in range(20):
+        node = festiv.node.node()
+        node._p = numpy.array(iso20.__unit_nodes__[i]) * 20
+        parent_element._nodes[i] = node
+
+    # --- 2. Subdivide the parent element into a new 8-element structure ---
+    subdivided_structure = festiv.meshing.subdivide_element(parent_element)
+
+    # --- 3. Apply boundary conditions to the new structure ---
+    # Fix the bottom face of the entire subdivided block.
+    # The bottom-most nodes are those with the minimum Z coordinate.
+    min_z = min(node._p[2] for node in subdivided_structure._nodes)
+    for node in subdivided_structure._nodes:
+        if numpy.isclose(node._p[2], min_z):
+            node._fixed.fill(1)
+
+    # Displace a single node on the top surface.
+    # Node 26 is the corner at (1,1,1) in the 3x3x3 grid, a top corner of the block.
+    top_node = subdivided_structure._nodes[26]
+    top_node._u = numpy.array([10, 10, 10])
+    top_node._fixed.fill(1)
+
+    # --- 4. Run the solver and visualize ---
+    logic = TissueSimulationLogic()
+    logic.run(subdivided_structure)
+
+    self.delayDisplay('Subdivision Test passed!')
