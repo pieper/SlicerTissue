@@ -4,6 +4,12 @@
 
 High-level Python API for soft tissue finite element simulation, built on the [Newton](https://github.com/newton-physics/newton) GPU-accelerated physics engine and [NVIDIA Warp](https://github.com/NVIDIA/warp).
 
+<img width="742" height="523" alt="image" src="https://github.com/user-attachments/assets/6b54bcba-5b40-404a-92ab-e919f341591b" />
+
+
+Example interactive simulation with three 20-node elements.  Left (blue nodes) is linear approximation and right (red nodes) is the non-linear solver.
+
+
 NewtonTissue provides a clean interface for defining tetrahedral meshes, material properties, boundary conditions, and loading — then solving via Newton's VBD or XPBD solvers with GPU acceleration.
 
 ## Features
