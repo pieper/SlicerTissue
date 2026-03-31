@@ -28,15 +28,20 @@ Basic usage::
 """
 
 from .boundary import BoundaryCondition, FixedBC, FixedByBox, FixedByPredicate
+from .hex_model import HexTissueModel
+from .hex_solver import HexTissueSolver
 from .loading import BodyForce, Gravity, LoadingCondition, PointForce, PrescribedDisplacement
 from .materials import (
     PROSTATE_PERIPHERAL,
     PROSTATE_TRANSITION,
+    AnisotropicMaterial,
     HeterogeneousMaterial,
     IsotropicMaterial,
     Material,
+    NodalMaterial,
 )
 from .model import TissueModel
+from .mpm import MPMMaterial, MPMSimulator
 from .results import SimulationResults
 from .solver import TissueSolver
 
@@ -45,12 +50,18 @@ __version__ = "0.1.0"
 __all__ = [
     "TissueModel",
     "TissueSolver",
+    "HexTissueModel",
+    "HexTissueSolver",
     "SimulationResults",
     "Material",
     "IsotropicMaterial",
     "HeterogeneousMaterial",
+    "NodalMaterial",
+    "AnisotropicMaterial",
     "PROSTATE_PERIPHERAL",
     "PROSTATE_TRANSITION",
+    "MPMMaterial",
+    "MPMSimulator",
     "BoundaryCondition",
     "FixedBC",
     "FixedByPredicate",

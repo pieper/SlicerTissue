@@ -200,13 +200,20 @@ class TissueModel:
                 )
 
         # Check heterogeneous material element count
-        from .materials import HeterogeneousMaterial
+        from .materials import HeterogeneousMaterial, NodalMaterial
 
         if isinstance(mat, HeterogeneousMaterial):
             if mat.num_elements != self.num_elements:
                 warnings.append(
                     f"HeterogeneousMaterial has {mat.num_elements} elements "
                     f"but mesh has {self.num_elements}."
+                )
+
+        if isinstance(mat, NodalMaterial):
+            if mat.num_nodes != self.num_nodes:
+                warnings.append(
+                    f"NodalMaterial has {mat.num_nodes} nodes "
+                    f"but mesh has {self.num_nodes}."
                 )
 
         return warnings

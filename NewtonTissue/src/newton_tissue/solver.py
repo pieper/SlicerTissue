@@ -110,7 +110,9 @@ class TissueSolver:
     def _build_newton_model(self, k_damp: float) -> newton.Model:
         """Construct the Newton Model from TissueModel specification."""
         mat = self._model.material
-        k_mu, k_lambda = mat.to_lame_arrays(self._model.num_elements)
+        k_mu, k_lambda = mat.to_lame_arrays(
+            self._model.num_elements, self._model.elements
+        )
         density = mat.get_density()
         if isinstance(density, np.ndarray):
             density = float(density.mean())

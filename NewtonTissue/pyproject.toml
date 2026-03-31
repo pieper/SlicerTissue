@@ -23,3 +23,6 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/newton_tissue"]
+
+[tool.hatch.metadata]
+allow-direct-references = true

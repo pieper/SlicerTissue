@@ -53,7 +53,7 @@ class TissueSimulationWidget(ScriptedLoadableModuleWidget):
     parametersFormLayout = qt.QFormLayout(parametersCollapsibleButton)
 
     # reload and run specific tests
-    scenarios = ("OneElement", "GluedBeam", "TwoElements", "Slab", "Subdivision", "Stack3Compare", "Newton", "MPM")
+    scenarios = ("OneElement", "GluedBeam", "TwoElements", "Slab", "Subdivision", "Stack3Compare", "Newton", "MPM", "LayeredTissueHex", "LayeredAnisotropicTissue", "ResolutionCompare", "WarpMPM")
     for scenario in scenarios:
       button = qt.QPushButton("Reload and Test %s" % scenario)
       button.toolTip = "Reload this module and then run the %s self test." % scenario
@@ -106,7 +106,7 @@ class TissueSimulationLogic(ScriptedLoadableModuleLogic):
     self.model = None
 
   def createModel(self):
-    self.gridder._steps = (3,)*6
+    self.gridder._steps = (9,)*6
     self.gridder.surface_grid()
     # TODO
     # load directly to slicer node
@@ -273,6 +273,14 @@ class TissueSimulationTest(ScriptedLoadableModuleTest):
       self.test_NewtonPackage()
     elif scenario == "MPM":
       self.test_MPMSimulation()
+    elif scenario == "LayeredTissueHex":
+      self.test_LayeredTissueHex()
+    elif scenario == "LayeredAnisotropicTissue":
+      self.test_LayeredAnisotropicTissue()
+    elif scenario == "ResolutionCompare":
+      self.test_ResolutionCompare()
+    elif scenario == "WarpMPM":
+      self.test_WarpMPM()
     else:
       self.delayDisplay(f"Unknown test scenario: {scenario}", 3000)
       self.fail(f"Unknown test scenario: {scenario}")
@@ -807,6 +815,347 @@ class TissueSimulationTest(ScriptedLoadableModuleTest):
     logic.run(s)
 
     self.delayDisplay('Slab Test passed!')
+
+  def test_LayeredTissueHex(self):
+    """Interactive multi-layer tissue simulation using 20-node serendipity hex elements.
+
+    Creates a 4-layer tissue block (liver/muscle/fat/skin) with Neo-Hookean
+    hyperelasticity via warp.fem. Bottom face is fixed; a draggable markup
+    fiducial on the top surface applies a prescribed displacement BC.
+
+    Self-test checks:
+      - Model and fiducials are created in the scene
+      - Simulated displacement is non-zero after initial solve
+      - Re-solve after programmatic BC change produces different displacements
+    """
+    self.delayDisplay("Starting LayeredTissueHex test", 100)
+
+    import os, sys
+    scriptPath = os.path.join(
+        os.path.dirname(os.path.dirname(__file__)),
+        "NewtonTissue", "examples", "layered_tissue_hex.py")
+    if not os.path.exists(scriptPath):
+      self.fail(f"layered_tissue_hex.py not found at {scriptPath}")
+
+    # Import LayeredTissueHex without triggering the entry-point guard
+    examplesDir = os.path.dirname(scriptPath)
+    srcDir = os.path.join(os.path.dirname(examplesDir), 'src')
+    for d in [examplesDir, srcDir]:
+      if d not in sys.path:
+        sys.path.insert(0, d)
+
+    # Flush stale newton_tissue cache so updated workspace files are picked up
+    import importlib, importlib.util
+    for _k in [k for k in sys.modules if 'newton_tissue' in k]:
+        del sys.modules[_k]
+
+    spec = importlib.util.spec_from_file_location("layered_tissue_hex", scriptPath)
+    mod  = importlib.util.module_from_spec(spec)
+    mod.slicer = None   # prevents entry-point guard from firing on import
+    spec.loader.exec_module(mod)
+    LayeredTissueHex = mod.LayeredTissueHex
+
+    # ── Instantiate and run ──────────────────────────────────────────────
+    try:
+      import warp as wp
+    except ImportError:
+      self.delayDisplay("warp not available — skipping LayeredTissueHex test", 2000)
+      return
+
+    sim = LayeredTissueHex(device="cpu")
+    sim.run()
+    slicer.app.processEvents()
+
+    # ── Assert model was created ─────────────────────────────────────────
+    self.assertIsNotNone(sim.vtk_model,
+                         "VTK model node was not created")
+    self.assertIsNotNone(sim.fiducial_list,
+                         "Fiducial list was not created")
+    self.assertIsNotNone(
+        slicer.mrmlScene.GetFirstNodeByName('LayeredTissueHex'),
+        "LayeredTissueHex model not found in scene")
+
+    # ── Assert non-zero displacement from initial solve ──────────────────
+    u_initial = sim.u_field.dof_values.numpy().copy()
+    free_dofs = [i for i in range(sim.n_dof) if i not in sim.bc_dofs]
+    max_disp = max(numpy.linalg.norm(u_initial[i]) for i in free_dofs)
+    self.assertGreater(max_disp, 1e-6,
+                       f"Expected non-zero displacement, got max={max_disp}")
+    self.delayDisplay(f"  Initial max free-node displacement: {max_disp*1000:.2f} mm")
+
+    # ── Assert re-solve changes displacements ────────────────────────────
+    # Use full solve from scratch for reliable comparison
+    u_vals = numpy.zeros((sim.n_dof, 3), dtype=numpy.float32)
+    u_vals[sim.palp_dof] = [0.0, -0.010, 0.0]
+    sim.u_field.dof_values.assign(wp.array(u_vals, dtype=wp.vec3))
+    sim._newton_solve(n_load_steps=4)
+    sim.updateModel()
+    slicer.app.processEvents()
+
+    u_after = sim.u_field.dof_values.numpy()
+    max_disp_after = max(numpy.linalg.norm(u_after[i]) for i in free_dofs)
+    self.assertGreater(max_disp_after, max_disp,
+                       "Larger BC should produce larger displacements")
+    self.delayDisplay(
+        f"  After larger BC: max free-node displacement = {max_disp_after*1000:.2f} mm")
+
+    # Restore initial state so interactive simulation is ready after the test
+    u_reset = numpy.zeros((sim.n_dof, 3), dtype=numpy.float32)
+    u_reset[sim.palp_dof] = [0.0, -0.005, 0.0]
+    sim.u_field.dof_values.assign(wp.array(u_reset, dtype=wp.vec3))
+    sim._newton_solve(n_load_steps=4)
+    sim._last_converged_u = sim.u_field.dof_values.numpy().copy()
+    sim._last_converged_corner = sim.u_field.dof_values.numpy()[sim.palp_dof].copy()
+    sim.updateModel()
+    sim._sync_fiducials()
+    slicer.app.processEvents()
+
+    self.delayDisplay('LayeredTissueHex test passed!')
+
+  def test_LayeredAnisotropicTissue(self):
+    """Anisotropic layered tissue simulation (HGO fiber term, 20-node hex).
+
+    Parallel to test_LayeredTissueHex but uses AnisotropicMaterial.
+    Verifies:
+      - Model + fiducials created with AnisotropicMaterial
+      - Tissue layer coloring applied
+      - Displacement non-zero after initial solve
+      - Larger BC produces larger displacements
+      - X-push (along fiber) differs from Z-push (transverse) — confirms anisotropy
+    """
+    self.delayDisplay("Starting LayeredAnisotropicTissue test", 100)
+
+    import os, sys, importlib.util
+
+    scriptPath = os.path.join(
+        os.path.dirname(os.path.dirname(__file__)),
+        "NewtonTissue", "examples", "layered_aniso_hex.py")
+    if not os.path.exists(scriptPath):
+      self.fail(f"layered_aniso_hex.py not found at {scriptPath}")
+
+    examplesDir = os.path.dirname(scriptPath)
+    srcDir = os.path.join(os.path.dirname(examplesDir), 'src')
+    for d in [examplesDir, srcDir]:
+      if d not in sys.path:
+        sys.path.insert(0, d)
+
+    # Flush stale newton_tissue cache
+    import importlib
+    for _k in [k for k in sys.modules if 'newton_tissue' in k or 'layered_aniso' in k]:
+        del sys.modules[_k]
+
+    spec = importlib.util.spec_from_file_location("layered_aniso_hex", scriptPath)
+    mod  = importlib.util.module_from_spec(spec)
+    mod.slicer = None
+    spec.loader.exec_module(mod)
+    LayeredAnisotropicTissueHex = mod.LayeredAnisotropicTissueHex
+
+    try:
+      import warp as wp
+    except ImportError:
+      self.delayDisplay("warp not available — skipping LayeredAnisotropicTissue test", 2000)
+      return
+
+    sim = LayeredAnisotropicTissueHex(device="cpu")
+    sim.run()
+    slicer.app.processEvents()
+
+    self.assertIsNotNone(sim.vtk_model, "VTK model not created")
+    self.assertIsNotNone(sim.fiducial_list, "Fiducial list not created")
+    self.assertIsNotNone(
+        slicer.mrmlScene.GetFirstNodeByName('LayeredAnisotropicTissueHex'),
+        "LayeredAnisotropicTissueHex model not in scene")
+
+    # Verify anisotropic material
+    from newton_tissue import AnisotropicMaterial
+    self.assertIsInstance(sim.tissue_model.material, AnisotropicMaterial,
+                          "Material should be AnisotropicMaterial")
+
+    # Verify tissue layer coloring
+    dn = sim.vtk_model.GetDisplayNode()
+    self.assertEqual(dn.GetScalarVisibility(), 1, "Tissue layer coloring not applied")
+
+    # Verify non-zero displacement
+    u_initial = sim.u_field.dof_values.numpy().copy()
+    free_dofs = [i for i in range(sim.n_dof) if i not in sim.bc_dofs]
+    max_disp = max(numpy.linalg.norm(u_initial[i]) for i in free_dofs)
+    self.assertGreater(max_disp, 1e-6, f"Expected non-zero displacement, got {max_disp}")
+    self.delayDisplay(f"  Initial max free-node displacement: {max_disp*1000:.2f} mm")
+
+    # Larger BC → larger displacement
+    u_vals = numpy.zeros((sim.n_dof, 3), dtype=numpy.float32)
+    u_vals[sim.palp_dof] = [0.0, -0.010, 0.0]
+    sim.u_field.dof_values.assign(wp.array(u_vals, dtype=wp.vec3))
+    sim._newton_solve(n_load_steps=4)
+    sim.updateModel()
+    slicer.app.processEvents()
+    u_after = sim.u_field.dof_values.numpy()
+    max_disp_after = max(numpy.linalg.norm(u_after[i]) for i in free_dofs)
+    self.assertGreater(max_disp_after, max_disp, "Larger BC should give larger displacement")
+    self.delayDisplay(f"  After -10mm BC: {max_disp_after*1000:.2f} mm")
+
+    # Anisotropy check: X-push (along fiber) vs Z-push (transverse) differ
+    u_x = numpy.zeros((sim.n_dof, 3), dtype=numpy.float32)
+    u_x[sim.palp_dof] = [0.010, 0.0, 0.0]   # push along fiber (X)
+    sim.u_field.dof_values.assign(wp.array(u_x, dtype=wp.vec3))
+    sim._newton_solve(n_load_steps=4)
+    disp_x = max(numpy.linalg.norm(sim.u_field.dof_values.numpy()[i]) for i in free_dofs)
+
+    u_z = numpy.zeros((sim.n_dof, 3), dtype=numpy.float32)
+    u_z[sim.palp_dof] = [0.0, 0.0, 0.010]   # push transverse (Z)
+    sim.u_field.dof_values.assign(wp.array(u_z, dtype=wp.vec3))
+    sim._newton_solve(n_load_steps=4)
+    disp_z = max(numpy.linalg.norm(sim.u_field.dof_values.numpy()[i]) for i in free_dofs)
+
+    self.assertNotAlmostEqual(
+        disp_x, disp_z, places=4,
+        msg="X-push and Z-push should differ due to anisotropy")
+    self.delayDisplay(
+        f"  Anisotropy confirmed: X-push={disp_x*1000:.2f}mm, "
+        f"Z-push={disp_z*1000:.2f}mm  (ratio={disp_x/max(disp_z,1e-12):.2f})")
+
+    # Restore initial state
+    u_reset = numpy.zeros((sim.n_dof, 3), dtype=numpy.float32)
+    u_reset[sim.palp_dof] = [0.0, -0.005, 0.0]
+    sim.u_field.dof_values.assign(wp.array(u_reset, dtype=wp.vec3))
+    sim._newton_solve(n_load_steps=4)
+    sim._last_converged_u = sim.u_field.dof_values.numpy().copy()
+    sim._last_converged_corner = sim.u_field.dof_values.numpy()[sim.palp_dof].copy()
+    sim.updateModel()
+    sim._sync_fiducials()
+    slicer.app.processEvents()
+
+    self.delayDisplay('LayeredAnisotropicTissue test passed!')
+
+  def test_WarpMPM(self):
+    """Push-pull palpation realism test for MPM tissue block.
+
+    Simulates pressing a finger into soft tissue (Pillsbury Dough Boy style)
+    then releasing it.  Verifies:
+      1. Gravity settles free particles downward; fixed inferior face stays put.
+      2. Incremental push deforms the palpation region downward.
+      3. After pulling back and settling, tissue recovers toward its
+         gravity-settled shape (elastic Neo-Hookean recovery).
+    """
+    self.delayDisplay("Starting WarpMPM push-pull realism test", 200)
+
+    import importlib.util
+    if importlib.util.find_spec("warp") is None:
+      self.delayDisplay("warp not available — skipping WarpMPM test", 2000)
+      return
+
+    import os, sys, importlib.util
+
+    scriptPath = os.path.join(
+        os.path.dirname(os.path.dirname(__file__)),
+        "NewtonTissue", "examples", "mpm_tissue_block.py")
+    if not os.path.exists(scriptPath):
+      self.fail(f"mpm_tissue_block.py not found at {scriptPath}")
+
+    examplesDir = os.path.dirname(scriptPath)
+    srcDir = os.path.join(os.path.dirname(examplesDir), 'src')
+    for d in [examplesDir, srcDir]:
+      if d not in sys.path:
+        sys.path.insert(0, d)
+
+    for k in [k for k in sys.modules if 'newton_tissue.mpm' in k or 'mpm_tissue_block' in k]:
+      del sys.modules[k]
+
+    spec = importlib.util.spec_from_file_location("mpm_tissue_block", scriptPath)
+    mod  = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    MPMTissueBlock = mod.MPMTissueBlock
+
+    # Stop any previously running simulation loop to prevent GPU interference
+    if hasattr(slicer, 'mpmSim') and slicer.mpmSim is not None:
+      try:
+        slicer.mpmSim.stop_simulation_loop()
+      except Exception:
+        pass
+      slicer.mpmSim = None
+
+    sim = MPMTissueBlock()
+    sim.run()
+    slicer.app.processEvents()
+
+    free_mask  = ~sim.sim.fixed.numpy().astype(bool)
+    fixed_mask =  sim.sim.fixed.numpy().astype(bool)
+    n_free  = int(free_mask.sum())
+    n_fixed = int(fixed_mask.sum())
+    self.delayDisplay(
+        f"{sim.sim.n_particles} particles — {n_free} free, {n_fixed} fixed, "
+        f"device={sim.device}", 600)
+
+    # --- 1. Gravity settlement checks ---
+    pos0 = sim.sim.x0.numpy().copy()         # rest (pre-gravity) positions
+    pos_settled = sim.sim.get_positions().copy()   # after 50 warm-up steps
+
+    y_disp_free = pos_settled[free_mask, 1] - pos0[free_mask, 1]
+    self.assertLess(y_disp_free.mean(), -1e-6,
+                    "Free particles should have settled downward under gravity")
+
+    y_disp_fixed = pos_settled[fixed_mask, 1] - pos0[fixed_mask, 1]
+    self.assertAlmostEqual(float(numpy.abs(y_disp_fixed).max()), 0.0, places=6,
+                           msg="Inferior fixed particles must not move")
+    self.delayDisplay(
+        f"Gravity OK — free mean Y: {y_disp_free.mean()*1000:.2f} mm, "
+        f"fixed max Y: {abs(y_disp_fixed).max()*1e6:.1f} µm", 600)
+
+    # --- 2. Incremental push (force-based probe, animated) ---
+    self.delayDisplay("Pressing finger into tissue...", 400)
+    n_increments = 4
+    pressure_pa = 100_000.0
+    for i in range(n_increments):
+      sim.apply_palpation(pressure_pa=pressure_pa, n_steps=200, show_every=20)
+      sim.update_model()
+      slicer.app.processEvents()
+      self.delayDisplay(
+          f"  Push {i+1}/{n_increments} at {pressure_pa:.0f} Pa", 200)
+
+    pos_pushed = sim.sim.get_positions().copy()
+    dy_push_mm = (pos_pushed[sim._palp_mask, 1].mean()
+                  - pos_settled[sim._palp_mask, 1].mean()) * 1000.0
+    self.assertLess(dy_push_mm, -0.05,
+                    f"Push should move palpation region downward, got {dy_push_mm:.3f} mm")
+    self.delayDisplay(
+        f"Max depth reached — palpation region {abs(dy_push_mm):.1f} mm down. "
+        f"Now lifting finger...", 1000)
+
+    # --- 3. Finger lifts off — tissue recovers elastically (no imposed velocity) ---
+    # recover() runs sim.step(GRAVITY) only; the elastic Neo-Hookean energy drives
+    # the tissue back toward equilibrium with viscoelastic damping slowing it down.
+    self.delayDisplay("Finger lifted — elastic recovery in progress...", 400)
+    sim.recover(n_steps=2000, show_every=5)
+
+    # --- 4. Check elastic recovery ---
+    pos_recovered = sim.sim.get_positions().copy()
+    residual_mm = (numpy.abs(pos_recovered[free_mask]
+                             - pos_settled[free_mask]).max() * 1000.0)
+    self.assertLess(residual_mm, 10.0,
+                    f"Elastic recovery should leave <10 mm residual, got {residual_mm:.2f} mm")
+    self.delayDisplay(
+        f"Recovery — max residual displacement: {residual_mm:.2f} mm", 1000)
+
+    slicer.mpmSim = sim
+    self.delayDisplay('WarpMPM push-pull test passed!')
+
+  def test_ResolutionCompare(self):
+    """Compare Low / Medium / High mesh resolution on the same anisotropic tissue.
+    Runs resolution_compare.py which creates three side-by-side hex models sharing
+    a single palpation fiducial.  Models are solved sequentially on drag.
+    """
+    self.delayDisplay("Starting Resolution Compare test", 100)
+
+    import os
+    scriptPath = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                              "NewtonTissue", "examples", "resolution_compare.py")
+    if not os.path.exists(scriptPath):
+      self.fail(f"resolution_compare.py not found at {scriptPath}")
+
+    import runpy
+    runpy.run_path(scriptPath, run_name='__main__')
+
+    self.delayDisplay('Resolution Compare test passed!')
 
   def test_TissueSimulation_Subdivision(self):
     """
