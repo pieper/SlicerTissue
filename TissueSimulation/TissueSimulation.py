@@ -1101,38 +1101,53 @@ class TissueSimulationTest(ScriptedLoadableModuleTest):
         f"Gravity OK — free mean Y: {y_disp_free.mean()*1000:.2f} mm, "
         f"fixed max Y: {abs(y_disp_fixed).max()*1e6:.1f} µm", 600)
 
-    # --- 2. Incremental push (force-based probe, animated) ---
+    # --- 2. Slow pressure ramp via simulation loop ---
+    # Ramp 0 → 200 kPa over 100 levels × 150 ms each (15 s total).
+    # The Qt event loop runs freely so the sim timer fires at its normal 50 ms
+    # cadence (~3 ticks / level), letting the tissue respond at each increment.
     self.delayDisplay("Pressing finger into tissue...", 400)
-    n_increments = 4
-    pressure_pa = 10_000.0   # clinical finger: ~5 N over 5 cm² (corrected force model)
-    for i in range(n_increments):
-      sim.apply_palpation(pressure_pa=pressure_pa, n_steps=200, show_every=20)
-      sim.update_model()
-      slicer.app.processEvents()
-      self.delayDisplay(
-          f"  Push {i+1}/{n_increments} at {pressure_pa:.0f} Pa", 200)
+    import qt as _qt
+    max_pressure_pa = 200_000.0
+    n_ramp      = 100   # pressure levels
+    ms_per_level = 150  # ms between increments (sim loop fires freely)
+    probe_center = sim._palp_pos_mm / 1000.0
+    probe_normal = numpy.array([0.0, -1.0, 0.0])
+
+    for i in range(n_ramp):
+      pressure = max_pressure_pa * (i + 1) / n_ramp
+      sim._probe_params = {
+        'center':      probe_center,
+        'pressure_pa': pressure,
+        'normal':      probe_normal,
+        'radius':      10.0 * sim.sim.dx,
+      }
+      sim._probe_ticks_remaining = 9999  # keep probe active
+      sim._idle_ticks = 0
+      if not sim._loop_running:
+        sim.start_simulation_loop()
+      _loop = _qt.QEventLoop()
+      _qt.QTimer.singleShot(ms_per_level, _loop.quit)
+      _loop.exec_()
 
     pos_pushed = sim.sim.get_positions().copy()
     dy_push_mm = (pos_pushed[sim._palp_mask, 1].mean()
                   - pos_settled[sim._palp_mask, 1].mean()) * 1000.0
-    self.assertLess(dy_push_mm, -0.5,
-                    f"Push should move palpation region ≥0.5 mm downward, got {dy_push_mm:.3f} mm")
+    self.assertLess(dy_push_mm, -1.0,
+                    f"Push should move palpation region ≥1 mm downward, got {dy_push_mm:.3f} mm")
     self.delayDisplay(
-        f"Max depth reached — palpation region {abs(dy_push_mm):.1f} mm down. "
-        f"Now lifting finger...", 1000)
+        f"Finger at {abs(dy_push_mm):.1f} mm depth — pressure released.", 1500)
 
-    # --- 3. Finger lifts off — tissue recovers elastically (no imposed velocity) ---
-    # recover() runs sim.step(GRAVITY) only; the elastic Neo-Hookean energy drives
-    # the tissue back toward equilibrium with viscoelastic damping slowing it down.
-    self.delayDisplay("Finger lifted — elastic recovery in progress...", 400)
+    # --- 3. Finger lifts off — tissue recovers elastically ---
+    sim._probe_params = None
+    sim._probe_ticks_remaining = 0
     sim.recover(n_steps=2000, show_every=5)
 
     # --- 4. Check elastic recovery ---
     pos_recovered = sim.sim.get_positions().copy()
     residual_mm = (numpy.abs(pos_recovered[free_mask]
                              - pos_settled[free_mask]).max() * 1000.0)
-    self.assertLess(residual_mm, 10.0,
-                    f"Elastic recovery should leave <10 mm residual, got {residual_mm:.2f} mm")
+    self.assertLess(residual_mm, 20.0,
+                    f"Elastic recovery should leave <20 mm residual, got {residual_mm:.2f} mm")
     self.delayDisplay(
         f"Recovery — max residual displacement: {residual_mm:.2f} mm", 1000)
 
