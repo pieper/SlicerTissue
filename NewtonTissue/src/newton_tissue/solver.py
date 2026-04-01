@@ -47,7 +47,7 @@ class TissueSolver:
     """High-level solver for soft tissue FEM simulation.
 
     Wraps Newton's VBD or XPBD solver with Neo-Hookean hyperelasticity on
-    tetrahedral meshes. Uses the TetMesh API for per-element material support.
+    tetrahedral meshes.
 
     Args:
         model: The tissue model to solve.
@@ -110,9 +110,13 @@ class TissueSolver:
     def _build_newton_model(self, k_damp: float) -> newton.Model:
         """Construct the Newton Model from TissueModel specification."""
         mat = self._model.material
-        k_mu, k_lambda = mat.to_lame_arrays(
+        k_mu_arr, k_lambda_arr = mat.to_lame_arrays(
             self._model.num_elements, self._model.elements
         )
+        # newton 1.0.0 add_soft_mesh requires scalar material constants
+        k_mu_scalar = float(k_mu_arr.mean())
+        k_lambda_scalar = float(k_lambda_arr.mean())
+
         density = mat.get_density()
         if isinstance(density, np.ndarray):
             density = float(density.mean())
@@ -123,15 +127,9 @@ class TissueSolver:
             self._model.elements,
         )
 
-        # Build TetMesh with per-element material arrays
-        tet_mesh = newton.TetMesh(
-            vertices=self._model.nodes.astype(np.float32),
-            tet_indices=elements.flatten(),
-            k_mu=k_mu.astype(np.float32),
-            k_lambda=k_lambda.astype(np.float32),
-            k_damp=np.full(self._model.num_elements, k_damp, dtype=np.float32),
-            density=density,
-        )
+        nodes_f32 = self._model.nodes.astype(np.float32)
+        vertices = [wp.vec3(float(v[0]), float(v[1]), float(v[2])) for v in nodes_f32]
+        indices = elements.flatten().tolist()
 
         builder = newton.ModelBuilder()
         builder.add_soft_mesh(
@@ -139,7 +137,12 @@ class TissueSolver:
             rot=wp.quat_identity(),
             scale=1.0,
             vel=wp.vec3(0.0, 0.0, 0.0),
-            mesh=tet_mesh,
+            vertices=vertices,
+            indices=indices,
+            density=density,
+            k_mu=k_mu_scalar,
+            k_lambda=k_lambda_scalar,
+            k_damp=k_damp,
         )
 
         # Fix boundary nodes by setting mass to zero (kinematic)
