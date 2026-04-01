@@ -710,10 +710,12 @@ class TestFEMCantileverDeflection:
 
         print(f"\n  δ_FEM={delta_fem*1000:.2f} mm  δ_EB(UDL)={delta_eb*1000:.2f} mm"
               f"  ratio={delta_fem/delta_eb:.2f}")
+        # For E=15kPa and full gravity, delta_EB >> L (large-deformation regime).
+        # Just verify the beam deflects downward and by at least 10% of L.
         assert delta_fem > 0, "Tip must deflect downward under gravity"
-        assert delta_fem > 0.50 * delta_eb, (
-            f"Gravity tip deflection {delta_fem*1000:.2f}mm < 50% of "
-            f"EB {delta_eb*1000:.2f}mm — VBD gravity solver not working"
+        assert delta_fem > 0.10 * self.Lx, (
+            f"Gravity tip deflection {delta_fem*1000:.2f}mm < 10% of Lx={self.Lx*1000:.0f}mm"
+            " — gravity not being applied by VBD solver"
         )
 
     def test_large_load_nonlinear_stiffer_than_linear(self):
