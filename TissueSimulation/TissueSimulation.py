@@ -1104,7 +1104,7 @@ class TissueSimulationTest(ScriptedLoadableModuleTest):
     # --- 2. Incremental push (force-based probe, animated) ---
     self.delayDisplay("Pressing finger into tissue...", 400)
     n_increments = 4
-    pressure_pa = 100_000.0
+    pressure_pa = 500_000.0
     for i in range(n_increments):
       sim.apply_palpation(pressure_pa=pressure_pa, n_steps=200, show_every=20)
       sim.update_model()
