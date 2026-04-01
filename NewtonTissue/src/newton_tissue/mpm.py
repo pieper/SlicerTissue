@@ -927,22 +927,31 @@ class MPMSimulator:
         within probe_radius of probe_center.  The pressure profile is a cosine
         bell: P(r) = probe_pressure_pa * 0.5*(1 + cos(π*r/R)).
 
-        The resulting body acceleration is a(r) = P(r) / rho * probe_normal.
-        Total force ≈ probe_pressure_pa * contact_area / 2.
+        Force model: finger contact pressure P [Pa] over circular area πR² is
+        distributed as body acceleration to particles in sphere volume (4/3)πR³:
+            a = P × πR² / (ρ × 4/3 × πR³) = P × 3 / (4ρR)  [m/s²]
+        This is dimensionally correct (Pa/m / (kg/m³) = m/s²).
+
+        Stability limit: P_max = ρ × c_s × 4R / (3 × dt)
+        At E=10 kPa, R=25 mm, dt=2e-4 s: P_max ≈ 540 kPa.
 
         Args:
             gravity:           gravity vector [m/s²]
             probe_center:      3-vector, probe contact centre [m]
             probe_pressure_pa: peak contact pressure [Pa] — positive pushes in
-                               probe_normal direction.  ~200 Pa gives ~5mm
-                               deflection for E=3 kPa, 80 mm block.
+                               probe_normal direction.  ~10 kPa gives ~20 mm
+                               deflection for E=10 kPa, 80 mm block.
+                               Clinical palpation: 5–25 kPa (1–5 N over 1–3 cm²).
             probe_normal:      unit vector of force direction (e.g. [0,-1,0] for
                                downward press on top face)
             probe_radius:      spatial falloff radius [m]
         """
         self.step(gravity)
         rho   = float(self.material.rho)
-        accel = np.asarray(probe_normal, dtype=np.float64) * (probe_pressure_pa / rho)
+        # Dimensionally correct: contact pressure P over area πR² distributed
+        # into sphere volume (4/3)πR³ → body accel = P × 3/(4ρR) [m/s²]
+        area_vol_ratio = 3.0 / (4.0 * float(probe_radius))  # [1/m]
+        accel = np.asarray(probe_normal, dtype=np.float64) * (probe_pressure_pa * area_vol_ratio / rho)
         c  = wp.vec3(float(probe_center[0]), float(probe_center[1]), float(probe_center[2]))
         a  = wp.vec3(float(accel[0]),        float(accel[1]),        float(accel[2]))
         with wp.ScopedDevice(self.device):

@@ -193,16 +193,13 @@ class MPMTissueBlock:
         pos_now = self.sim.get_positions()
         self.update_model()
 
-        if self._prev_tick_pos is not None and self._probe_ticks_remaining == 0:
-            # Threshold-based idle check: 10 µm robust to float32 precision
-            # (np.array_equal fails with damping=0.995 since particles settle
-            # more slowly and never reach exact float32 equality within 500 steps)
+        if self._prev_tick_pos is not None:
+            # Threshold-based idle check: stop when tissue reaches equilibrium.
+            # Works with or without active probe (probe holds tissue in place).
             if float(np.abs(pos_now - self._prev_tick_pos).max()) < 2e-5:
                 self._idle_ticks += 1
             else:
                 self._idle_ticks = 0
-        else:
-            self._idle_ticks = 0
         self._prev_tick_pos = pos_now
 
         if self._idle_ticks >= self._idle_ticks_to_stop:
@@ -217,7 +214,7 @@ class MPMTissueBlock:
     # Palpation
     # ------------------------------------------------------------------
 
-    def apply_palpation(self, pressure_pa=200.0, n_steps=500, show_every=0):
+    def apply_palpation(self, pressure_pa=10_000.0, n_steps=500, show_every=0):
         self._loop_running = False   # pause loop so timer ticks don't interfere
         probe_center = self._palp_pos_mm / 1000.0
         probe_normal = np.array([0.0, -1.0, 0.0])
@@ -351,7 +348,8 @@ class MPMTissueBlock:
         x, y, z = self._palp_pos_mm
         self.fiducial_list.AddControlPoint(x, y, z)
         self.fiducial_list.SetNthControlPointLabel(0, 'palp')
-        self._palp_ref_pos = np.array([x, y, z])
+        self._palp_ref_pos   = np.array([x, y, z])
+        self._palp_initial_mm = np.array([x, y, z])   # never updated — rest position
         self.fiducial_list.AddObserver(
             self.fiducial_list.PointModifiedEvent,
             lambda c, e: self._on_fiducial_moved(c))
@@ -359,25 +357,37 @@ class MPMTissueBlock:
     def _on_fiducial_moved(self, fiducial_list):
         p = [0.0, 0.0, 0.0]
         fiducial_list.GetNthControlPointPosition(0, p)
-        delta_mm = np.array(p) - self._palp_ref_pos
+        p_mm     = np.array(p)
+        delta_mm = p_mm - self._palp_initial_mm   # displacement from rest
         dist_mm  = float(np.linalg.norm(delta_mm))
+
         if dist_mm < 0.5:
+            # Probe returned to rest — release contact
+            self._probe_params          = None
+            self._probe_ticks_remaining = 0
+            self._idle_ticks            = 0
+            if not self._loop_running:
+                self.start_simulation_loop()
             return
-        # Clinical palpation: 1–5 N over ~1–2 cm² = 5–25 kPa (Egorova 2017).
-        # 250 kPa/mm: 1 mm drag → 250 kPa; 5 mm → 1.25 MPa (firm).
-        # Stability limit at E=10 kPa, dt=2e-4 s: ~1.66 MPa — safely below.
-        k_probe_pa_per_mm = 250_000.0
+
+        # Constant contact pressure — finger presses tissue at fiducial position.
+        # Calibrated: 10 kPa ≈ 5 N over 5 cm² (moderate clinical palpation).
+        # With corrected body-force formula (P × 3/(4ρR)), stability limit ≈ 540 kPa.
+        # At E=10 kPa and R=25 mm this gives ~20–30 mm equilibrium deflection.
+        contact_pressure_pa = 10_000.0
+
         self._probe_params = {
-            'center':      self._palp_pos_mm / 1000.0,
-            'pressure_pa': k_probe_pa_per_mm * dist_mm,
-            'normal':      delta_mm / dist_mm,
+            'center':      p_mm / 1000.0,        # probe IS at fiducial position
+            'pressure_pa': contact_pressure_pa,
+            'normal':      delta_mm / dist_mm,   # push direction = into tissue
             'radius':      10.0 * self.sim.dx,
         }
         ticks_per_second = 1000 // self._tick_interval_ms
-        self._probe_ticks_remaining = 2 * ticks_per_second
-        self._palp_pos_mm  = np.array(p)
-        self._palp_ref_pos = np.array(p)
-        self._idle_ticks = 0
+        # Keep probe on while finger is in tissue; user returns fiducial to rest to release.
+        self._probe_ticks_remaining = 30 * ticks_per_second
+        self._palp_pos_mm  = p_mm
+        self._palp_ref_pos = p_mm
+        self._idle_ticks   = 0
         if not self._loop_running:
             self.start_simulation_loop()
 

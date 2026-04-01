@@ -1104,7 +1104,7 @@ class TissueSimulationTest(ScriptedLoadableModuleTest):
     # --- 2. Incremental push (force-based probe, animated) ---
     self.delayDisplay("Pressing finger into tissue...", 400)
     n_increments = 4
-    pressure_pa = 500_000.0
+    pressure_pa = 10_000.0   # clinical finger: ~5 N over 5 cm² (corrected force model)
     for i in range(n_increments):
       sim.apply_palpation(pressure_pa=pressure_pa, n_steps=200, show_every=20)
       sim.update_model()
@@ -1115,8 +1115,8 @@ class TissueSimulationTest(ScriptedLoadableModuleTest):
     pos_pushed = sim.sim.get_positions().copy()
     dy_push_mm = (pos_pushed[sim._palp_mask, 1].mean()
                   - pos_settled[sim._palp_mask, 1].mean()) * 1000.0
-    self.assertLess(dy_push_mm, -0.05,
-                    f"Push should move palpation region downward, got {dy_push_mm:.3f} mm")
+    self.assertLess(dy_push_mm, -0.5,
+                    f"Push should move palpation region ≥0.5 mm downward, got {dy_push_mm:.3f} mm")
     self.delayDisplay(
         f"Max depth reached — palpation region {abs(dy_push_mm):.1f} mm down. "
         f"Now lifting finger...", 1000)
