@@ -143,6 +143,7 @@ class TissueSolver:
             k_mu=k_mu_scalar,
             k_lambda=k_lambda_scalar,
             k_damp=k_damp,
+            add_surface_mesh_edges=False,  # avoid spurious forces on non-manifold tet surfaces
         )
 
         # Fix boundary nodes by setting mass to zero (kinematic)
