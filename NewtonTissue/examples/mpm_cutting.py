@@ -85,8 +85,11 @@ def build_scalpel_sdf(sim, curve_points_ras_mm, depth_mm=20.0,
     gx, gy, gz = np.meshgrid(gi * dx, gi * dx, gi * dx, indexing='ij')
     grid_pos = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=1)  # (ng^3, 3)
 
-    # For each grid node, find distance to the cutting ribbon
-    sdf = np.full(ng**3, 1e6, dtype=np.float32)  # large positive = far from cut
+    # For each grid node, find distance to the cutting ribbon.
+    # Default 0.0 = not near any cut.  The side check in _p2g_cut/_g2p_cut
+    # uses sign(p_sdf) * sign(g_sdf) < 0 to block transfers.  Zero means
+    # "neutral" — transfers are never blocked for zero-SDF nodes.
+    sdf = np.zeros(ng**3, dtype=np.float32)
 
     # Process each segment of the polyline
     depth_m = depth_mm / 1000.0
@@ -133,9 +136,12 @@ def build_scalpel_sdf(sim, curve_points_ras_mm, depth_mm=20.0,
         candidate_sdf = d_normal
         # For inactive nodes, keep the large positive default
 
-        # Update SDF: take the value with smallest absolute distance
-        closer = active & (np.abs(candidate_sdf) < np.abs(sdf))
-        sdf[closer] = candidate_sdf[closer]
+        # Update SDF: for active nodes, take the value with smallest
+        # absolute distance.  Nodes that haven't been assigned yet (sdf=0)
+        # always get overwritten by the first active value.
+        unassigned = active & (sdf == 0.0)
+        closer = active & (sdf != 0.0) & (np.abs(candidate_sdf) < np.abs(sdf))
+        sdf[unassigned | closer] = candidate_sdf[unassigned | closer]
 
     return sdf
 
