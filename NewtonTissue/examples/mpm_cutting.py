@@ -190,77 +190,28 @@ class CurveObserver:
         self._observer_tags = []
         self._processed_curves = set()
 
-        # Watch for new nodes added to the scene
-        tag = slicer.mrmlScene.AddObserver(
-            slicer.mrmlScene.NodeAddedEvent,
-            self._on_node_added)
-        self._observer_tags.append(('scene', tag))
-        print("CurveObserver: watching for open curve markups")
+        # Watch the interaction node for EndPlacementEvent — fires when the
+        # user finishes placing points on any markup.
+        interaction = slicer.app.applicationLogic().GetInteractionNode()
+        tag = interaction.AddObserver(
+            interaction.EndPlacementEvent,
+            self._on_end_placement)
+        self._observer_tags.append(('interaction', tag))
+        print("CurveObserver: watching for completed open curve markups")
 
-    def _on_node_added(self, scene, event):
-        """Called when any node is added to the scene."""
+    def _on_end_placement(self, interaction_node, event):
+        """Called when the user exits placement mode for any markup."""
         import slicer
 
-        # Check all markup curve nodes — find any new open curves
+        # Find any unprocessed curve nodes with enough points
         nodes = slicer.mrmlScene.GetNodesByClass('vtkMRMLMarkupsCurveNode')
         for i in range(nodes.GetNumberOfItems()):
             node = nodes.GetItemAsObject(i)
             node_id = node.GetID()
             if node_id in self._processed_curves:
                 continue
-
-            # Watch this curve for placement completion
-            if not hasattr(node, '_mpm_cut_observer'):
-                tag = node.AddObserver(
-                    node.PointEndInteractionEvent,
-                    lambda caller, ev, n=node: self._on_curve_modified(n))
-                node._mpm_cut_observer = tag
-
-                # Also check if the curve is already complete
-                tag2 = node.AddObserver(
-                    node.PointPositionDefinedEvent,
-                    lambda caller, ev, n=node: self._check_curve_ready(n))
-                node._mpm_cut_observer2 = tag2
-
-    def _check_curve_ready(self, curve_node):
-        """Check if the curve has enough points and placement is done."""
-        import slicer
-        node_id = curve_node.GetID()
-        if node_id in self._processed_curves:
-            return
-
-        # Only process if the curve has at least 2 control points
-        # and the interaction node is NOT in placement mode
-        n_pts = curve_node.GetNumberOfControlPoints()
-        if n_pts < 2:
-            return
-
-        interaction = slicer.mrmlScene.GetNodeByID(
-            'vtkMRMLInteractionNodeSingleton')
-        if interaction and interaction.GetCurrentInteractionMode() == 1:
-            # Still in placement mode — wait
-            return
-
-        self._apply_cut(curve_node)
-
-    def _on_curve_modified(self, curve_node):
-        """Called when a curve point interaction ends."""
-        import slicer
-        node_id = curve_node.GetID()
-        if node_id in self._processed_curves:
-            return
-
-        n_pts = curve_node.GetNumberOfControlPoints()
-        if n_pts < 2:
-            return
-
-        # Check if still in placement mode
-        interaction = slicer.mrmlScene.GetNodeByID(
-            'vtkMRMLInteractionNodeSingleton')
-        if interaction and interaction.GetCurrentInteractionMode() == 1:
-            return
-
-        self._apply_cut(curve_node)
+            if node.GetNumberOfControlPoints() >= 2:
+                self._apply_cut(node)
 
     def _apply_cut(self, curve_node):
         """Build SDF from the curve and apply the cut."""
@@ -289,6 +240,9 @@ class CurveObserver:
         """Remove all observers."""
         import slicer
         for kind, tag in self._observer_tags:
-            if kind == 'scene':
+            if kind == 'interaction':
+                interaction = slicer.app.applicationLogic().GetInteractionNode()
+                interaction.RemoveObserver(tag)
+            elif kind == 'scene':
                 slicer.mrmlScene.RemoveObserver(tag)
         self._observer_tags.clear()
