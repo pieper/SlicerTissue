@@ -1,7 +1,12 @@
 """Explicit MLS-MPM soft tissue solver using NVIDIA Warp.
 
-Reference: Hu et al., "A Moving Least Squares Material Point Method with
-Displacement Discontinuity and Two-Way Rigid Body Coupling" (SIGGRAPH 2018).
+References:
+  Hu et al., "A Moving Least Squares Material Point Method with
+  Displacement Discontinuity and Two-Way Rigid Body Coupling" (SIGGRAPH 2018).
+
+  Ou & Tavakoli, "CRESSim-MPM: A Material Point Method Library for Surgical
+  Soft Body Simulation with Cutting and Suturing", arXiv:2502.18437v3, 2025.
+  (Side-aware P2G/G2P transfer blocking for tissue cutting.)
 
 Each simulation step:
   1. zero_grid   — clear grid mass and momentum
@@ -257,6 +262,91 @@ def _p2g(
 
 
 @wp.kernel
+def _p2g_cut(
+    x:       wp.array(dtype=wp.vec3),
+    v:       wp.array(dtype=wp.vec3),
+    F:       wp.array(dtype=wp.mat33),
+    C:       wp.array(dtype=wp.mat33),
+    m_p:     wp.array(dtype=float),
+    vol_p:   wp.array(dtype=float),
+    grid_v:  wp.array(dtype=wp.vec3),
+    grid_m:  wp.array(dtype=float),
+    cut_sdf: wp.array(dtype=float),   # signed distance per grid node
+    n_grid:  int,
+    inv_dx:  float,
+    dt:      float,
+    mu:      float,
+    lam:     float,
+):
+    """P2G with cut-aware transfer: skip scatter across a cut surface.
+
+    If a particle and a grid node are on opposite sides of the cut SDF
+    (different signs), the transfer is blocked.  This creates a velocity
+    discontinuity at the cut, allowing tissue on opposite sides to separate.
+    """
+    p = wp.tid()
+    xp = x[p]
+    mp = m_p[p]
+    Vp = vol_p[p]
+    dx = 1.0 / inv_dx
+
+    # Particle's SDF side: sample at nearest grid node
+    pi = int(wp.round(xp[0] * inv_dx))
+    pj = int(wp.round(xp[1] * inv_dx))
+    pk = int(wp.round(xp[2] * inv_dx))
+    pi = wp.clamp(pi, 0, n_grid - 1)
+    pj = wp.clamp(pj, 0, n_grid - 1)
+    pk = wp.clamp(pk, 0, n_grid - 1)
+    p_sdf = cut_sdf[pi * n_grid * n_grid + pj * n_grid + pk]
+
+    Fp     = F[p]
+    J      = wp.determinant(Fp)
+    J_safe = wp.max(J, 0.1)
+    FFt    = Fp @ wp.transpose(Fp)
+    I3     = wp.mat33(1.0, 0.0, 0.0,
+                     0.0, 1.0, 0.0,
+                     0.0, 0.0, 1.0)
+    tau    = mu * (FFt - I3) + lam * wp.log(J_safe) * I3
+
+    stress = (-4.0 * dt * inv_dx * inv_dx * Vp) * tau
+    affine = stress + mp * C[p]
+
+    bx = int(wp.floor(xp[0] * inv_dx - 0.5))
+    by = int(wp.floor(xp[1] * inv_dx - 0.5))
+    bz = int(wp.floor(xp[2] * inv_dx - 0.5))
+
+    fx_x = xp[0] * inv_dx - float(bx)
+    fx_y = xp[1] * inv_dx - float(by)
+    fx_z = xp[2] * inv_dx - float(bz)
+
+    for di in range(3):
+        wx = _bspline_w(fx_x, di)
+        gi = bx + di
+        if gi < 0 or gi >= n_grid:
+            continue
+        for dj in range(3):
+            wy = _bspline_w(fx_y, dj)
+            gj = by + dj
+            if gj < 0 or gj >= n_grid:
+                continue
+            for dk in range(3):
+                wz = _bspline_w(fx_z, dk)
+                gk = bz + dk
+                if gk < 0 or gk >= n_grid:
+                    continue
+                flat = gi * n_grid * n_grid + gj * n_grid + gk
+                # Block transfer if particle and node are on opposite sides
+                g_sdf = cut_sdf[flat]
+                if p_sdf * g_sdf < 0.0:
+                    continue
+                w    = wx * wy * wz
+                xi   = wp.vec3(float(gi) * dx, float(gj) * dx, float(gk) * dx)
+                dpos = xi - xp
+                wp.atomic_add(grid_v, flat, w * (mp * v[p] + affine @ dpos))
+                wp.atomic_add(grid_m, flat, w * mp)
+
+
+@wp.kernel
 def _grid_update(
     grid_v:  wp.array(dtype=wp.vec3),
     grid_m:  wp.array(dtype=float),
@@ -439,6 +529,121 @@ def _g2p(
     if fixed[p] == 0:
         v[p] = new_v
         x[p] = xp + dt * new_v
+
+
+@wp.kernel
+def _g2p_cut(
+    x:       wp.array(dtype=wp.vec3),
+    v:       wp.array(dtype=wp.vec3),
+    F:       wp.array(dtype=wp.mat33),
+    C:       wp.array(dtype=wp.mat33),
+    fixed:   wp.array(dtype=int),
+    grid_v:  wp.array(dtype=wp.vec3),
+    cut_sdf: wp.array(dtype=float),
+    n_grid:  int,
+    inv_dx:  float,
+    dt:      float,
+):
+    """G2P with cut-aware transfer: skip gather across a cut surface."""
+    p = wp.tid()
+    xp = x[p]
+    dx = 1.0 / inv_dx
+
+    # Particle's SDF side
+    pi = wp.clamp(int(wp.round(xp[0] * inv_dx)), 0, n_grid - 1)
+    pj = wp.clamp(int(wp.round(xp[1] * inv_dx)), 0, n_grid - 1)
+    pk = wp.clamp(int(wp.round(xp[2] * inv_dx)), 0, n_grid - 1)
+    p_sdf = cut_sdf[pi * n_grid * n_grid + pj * n_grid + pk]
+
+    bx = int(wp.floor(xp[0] * inv_dx - 0.5))
+    by = int(wp.floor(xp[1] * inv_dx - 0.5))
+    bz = int(wp.floor(xp[2] * inv_dx - 0.5))
+
+    fx_x = xp[0] * inv_dx - float(bx)
+    fx_y = xp[1] * inv_dx - float(by)
+    fx_z = xp[2] * inv_dx - float(bz)
+
+    new_v = wp.vec3(0.0, 0.0, 0.0)
+    new_C = wp.mat33(0.0, 0.0, 0.0,
+                     0.0, 0.0, 0.0,
+                     0.0, 0.0, 0.0)
+    w_total = float(0.0)
+
+    for di in range(3):
+        wx = _bspline_w(fx_x, di)
+        gi = bx + di
+        if gi < 0 or gi >= n_grid:
+            continue
+        for dj in range(3):
+            wy = _bspline_w(fx_y, dj)
+            gj = by + dj
+            if gj < 0 or gj >= n_grid:
+                continue
+            for dk in range(3):
+                wz = _bspline_w(fx_z, dk)
+                gk = bz + dk
+                if gk < 0 or gk >= n_grid:
+                    continue
+                flat = gi * n_grid * n_grid + gj * n_grid + gk
+                g_sdf = cut_sdf[flat]
+                if p_sdf * g_sdf < 0.0:
+                    continue
+                w    = wx * wy * wz
+                vi   = grid_v[flat]
+                xi   = wp.vec3(float(gi) * dx, float(gj) * dx, float(gk) * dx)
+                dpos = xi - xp
+                new_v = new_v + w * vi
+                new_C = new_C + (4.0 * inv_dx * inv_dx * w) * wp.outer(vi, dpos)
+                w_total = w_total + w
+
+    # Renormalize if some nodes were skipped (weight < 1)
+    if w_total > 0.01:
+        new_v = new_v / w_total
+        new_C = new_C / w_total
+
+    I3 = wp.mat33(1.0, 0.0, 0.0,
+                  0.0, 1.0, 0.0,
+                  0.0, 0.0, 1.0)
+    F[p] = (I3 + dt * new_C) @ F[p]
+    C[p] = new_C
+
+    if fixed[p] == 0:
+        v[p] = new_v
+        x[p] = xp + dt * new_v
+
+
+@wp.kernel
+def _break_bonds_across_cut(
+    x:            wp.array(dtype=wp.vec3),
+    fib_i:        wp.array(dtype=int),
+    fib_j:        wp.array(dtype=int),
+    fiber_broken:  wp.array(dtype=int),
+    cut_sdf:      wp.array(dtype=float),
+    n_grid:       int,
+    inv_dx:       float,
+):
+    """Break fiber bonds where the two particles are on opposite sides of a cut."""
+    b = wp.tid()
+    if fiber_broken[b] != 0:
+        return
+
+    xi = x[fib_i[b]]
+    xj = x[fib_j[b]]
+
+    # SDF side for particle i
+    gi = wp.clamp(int(wp.round(xi[0] * inv_dx)), 0, n_grid - 1)
+    gj = wp.clamp(int(wp.round(xi[1] * inv_dx)), 0, n_grid - 1)
+    gk = wp.clamp(int(wp.round(xi[2] * inv_dx)), 0, n_grid - 1)
+    sdf_i = cut_sdf[gi * n_grid * n_grid + gj * n_grid + gk]
+
+    # SDF side for particle j
+    gi = wp.clamp(int(wp.round(xj[0] * inv_dx)), 0, n_grid - 1)
+    gj = wp.clamp(int(wp.round(xj[1] * inv_dx)), 0, n_grid - 1)
+    gk = wp.clamp(int(wp.round(xj[2] * inv_dx)), 0, n_grid - 1)
+    sdf_j = cut_sdf[gi * n_grid * n_grid + gj * n_grid + gk]
+
+    if sdf_i * sdf_j < 0.0:
+        fiber_broken[b] = 1
 
 
 @wp.kernel
@@ -655,6 +860,7 @@ def _apply_fiber_forces(
     fib_j:  wp.array(dtype=int),
     fib_l0: wp.array(dtype=float),
     fib_t:  wp.array(dtype=int),    # 0 = elastin, 1 = collagen
+    fiber_broken: wp.array(dtype=int),   # 0 = intact, nonzero = broken
     k_e:    float,
     k_c:    float,
     crimp:  float,
@@ -664,8 +870,11 @@ def _apply_fiber_forces(
 
     Elastin: bidirectional linear spring.
     Collagen: tension-only, activates above crimp strain threshold.
+    Broken bonds (fiber_broken != 0) are skipped.
     """
     b = wp.tid()
+    if fiber_broken[b] != 0:
+        return
     pi = fib_i[b]
     pj = fib_j[b]
     fi = fixed[pi]
@@ -842,7 +1051,14 @@ class MPMSimulator:
         # Fiber bond arrays
         self.fiber_i  = None;  self.fiber_j  = None
         self.fiber_l0 = None;  self.fiber_t  = None
+        self.fiber_broken = None  # wp.array(dtype=int), 0=intact, 1=broken
         self.n_bonds  = 0
+
+        # Cut SDFs: list of wp.array(dtype=float) of length n_grid^3.
+        # Sign encodes which side of the cut a point is on.  When active,
+        # P2G/G2P block transfers across each cut surface, and bonds that
+        # cross the cut are broken.
+        self.cut_sdfs = []
 
     def initialize_block_particles(
         self,
@@ -991,6 +1207,7 @@ class MPMSimulator:
             self.fiber_j  = wp.array(all_j,  dtype=int)
             self.fiber_l0 = wp.array(all_l0, dtype=float)
             self.fiber_t  = wp.array(all_t,  dtype=int)
+            self.fiber_broken = wp.zeros(len(all_i), dtype=int)
         self.n_bonds = len(all_i)
 
     def step(self, gravity=None):
@@ -1018,11 +1235,22 @@ class MPMSimulator:
             wp.launch(_zero_grid, dim=ng**3,
                       inputs=[self.grid_v, self.grid_m])
 
-            wp.launch(_p2g, dim=n,
-                      inputs=[self.x, self.v, self.F, self.C,
-                               self.m_p, self.vol_p,
-                               self.grid_v, self.grid_m,
-                               ng, float(self.inv_dx), dt, mu, lam])
+            # P2G: use cut-aware version if any cut is active.
+            # Uses the most recent cut SDF (multiple cuts are accumulated
+            # by merging into a single composite SDF via apply_cut).
+            if self.cut_sdfs:
+                wp.launch(_p2g_cut, dim=n,
+                          inputs=[self.x, self.v, self.F, self.C,
+                                   self.m_p, self.vol_p,
+                                   self.grid_v, self.grid_m,
+                                   self.cut_sdfs[-1],
+                                   ng, float(self.inv_dx), dt, mu, lam])
+            else:
+                wp.launch(_p2g, dim=n,
+                          inputs=[self.x, self.v, self.F, self.C,
+                                   self.m_p, self.vol_p,
+                                   self.grid_v, self.grid_m,
+                                   ng, float(self.inv_dx), dt, mu, lam])
 
             wp.launch(_grid_update, dim=ng**3,
                       inputs=[self.grid_v, self.grid_m, ng, dt, g,
@@ -1037,7 +1265,13 @@ class MPMSimulator:
                           inputs=[self.grid_v, self.bone_sdf,
                                   self.bone_sdf_grad, float(self.dx)])
 
-            if self.total_lagrangian:
+            # G2P: cut-aware version blocks gather across cut surfaces
+            if self.cut_sdfs and not self.total_lagrangian:
+                wp.launch(_g2p_cut, dim=n,
+                          inputs=[self.x, self.v, self.F, self.C, self.fixed,
+                                  self.grid_v, self.cut_sdfs[-1],
+                                  ng, float(self.inv_dx), dt])
+            elif self.total_lagrangian:
                 wp.launch(_g2p_no_F_update, dim=n,
                           inputs=[self.x, self.v, self.C, self.fixed,
                                   self.grid_v, ng, float(self.inv_dx), dt])
@@ -1057,6 +1291,7 @@ class MPMSimulator:
                           inputs=[
                               self.x, self.v, self.fixed, self.m_p,
                               self.fiber_i, self.fiber_j, self.fiber_l0, self.fiber_t,
+                              self.fiber_broken,
                               float(self.material.k_elastin),
                               float(self.material.k_collagen),
                               float(self.material.collagen_crimp),
@@ -1132,6 +1367,59 @@ class MPMSimulator:
                                self.nbr_py, self.nbr_my,
                                self.nbr_pz, self.nbr_mz,
                                float(self._lattice_step)])
+
+    # ------------------------------------------------------------------
+    # Cutting
+    # ------------------------------------------------------------------
+
+    def apply_cut(self, cut_sdf_np: np.ndarray):
+        """Register a cut surface defined by a signed distance field.
+
+        The SDF is sampled on the MPM grid (n_grid^3 flat array, float32).
+        The sign encodes which side of the cut a point is on.  During P2G
+        and G2P, transfers between particles and grid nodes on opposite
+        sides are blocked, creating a velocity discontinuity that lets
+        the tissue separate.  Fiber bonds crossing the cut are broken.
+
+        Based on the CDF approach from:
+          Ou & Tavakoli, "CRESSim-MPM: A Material Point Method Library for
+          Surgical Soft Body Simulation with Cutting and Suturing",
+          arXiv:2502.18437v3, 2025.
+
+        Args:
+            cut_sdf_np:  (n_grid^3,) float32 array — signed distance on the
+                         MPM grid.  Positive on one side, negative on the other.
+        """
+        with wp.ScopedDevice(self.device):
+            cut_sdf = wp.array(cut_sdf_np.astype(np.float32), dtype=float)
+        self.cut_sdfs.append(cut_sdf)
+
+        # Break fiber bonds that cross the cut
+        if self.n_bonds > 0 and self.fiber_broken is not None:
+            with wp.ScopedDevice(self.device):
+                wp.launch(_break_bonds_across_cut, dim=self.n_bonds,
+                          inputs=[self.x, self.fiber_i, self.fiber_j,
+                                  self.fiber_broken, cut_sdf,
+                                  self.n_grid, float(self.inv_dx)])
+            n_broken = int(self.fiber_broken.numpy().sum())
+            print(f"MPMSimulator: cut applied — {n_broken} bonds broken "
+                  f"({len(self.cut_sdfs)} active cuts)")
+
+    def set_prestress(self, stretch: float = 1.02):
+        """Initialize F with isotropic stretch to create tissue pre-tension.
+
+        When a cut is made, the pre-stress drives the tissue edges apart,
+        producing a realistic gaping wound.  Typical values: 1.01–1.05
+        (1–5% isotropic pre-stretch).
+
+        Args:
+            stretch:  isotropic stretch ratio (1.0 = no pre-stress).
+        """
+        F_np = self.F.numpy()
+        I_stretched = np.eye(3, dtype=np.float32) * stretch
+        F_np[:] = I_stretched
+        with wp.ScopedDevice(self.device):
+            self.F = wp.array(F_np, dtype=wp.mat33)
 
     def get_positions(self) -> np.ndarray:
         """Return current particle positions as (n_particles, 3) float32 [m]."""

@@ -1282,12 +1282,28 @@ class TissueSimulationTest(ScriptedLoadableModuleTest):
         f"Gravity OK — tissue mean Z disp: {z_disp_free.mean()*1000:.2f} mm, "
         f"bone max disp: {bone_disp*1e6:.1f} µm", 600)
 
-    # --- 6. Launch interactive visualisation + gravity slider ---
+    # --- 6. Apply tissue pre-stress so cuts gape open ---
+    sim.sim.set_prestress(stretch=1.03)   # 3% isotropic pre-tension
+
+    # --- 7. Launch interactive visualisation + gravity slider ---
     sim.run()
     slicer.app.processEvents()
 
+    # --- 8. Set up curve observer for interactive cutting ---
+    # When the user draws an open curve markup, a scalpel cut is
+    # automatically applied along that path down to bone depth.
+    cuttingPath = os.path.join(examplesDir, "mpm_cutting.py")
+    if os.path.exists(cuttingPath):
+      for k in [k for k in sys.modules if 'mpm_cutting' in k]:
+        del sys.modules[k]
+      cut_spec = importlib.util.spec_from_file_location("mpm_cutting", cuttingPath)
+      cut_mod  = importlib.util.module_from_spec(cut_spec)
+      cut_spec.loader.exec_module(cut_mod)
+      sim._curve_observer = cut_mod.CurveObserver(sim, depth_mm=25.0)
+      self.delayDisplay("Curve observer active — draw an open curve to cut!", 800)
+
     slicer.mpmSim = sim
-    self.delayDisplay('CTHeadMPM test passed — drag the gravity slider!')
+    self.delayDisplay('CTHeadMPM test passed — use gravity slider and draw curves to cut!')
 
   def test_ResolutionCompare(self):
     """Compare Low / Medium / High mesh resolution on the same anisotropic tissue.

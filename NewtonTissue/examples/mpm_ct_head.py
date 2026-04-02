@@ -395,6 +395,7 @@ class MPMCTHead:
             self.sim.fiber_j  = wp.array(all_j,  dtype=int)
             self.sim.fiber_l0 = wp.array(all_l0, dtype=float)
             self.sim.fiber_t  = wp.array(all_t,  dtype=int)
+            self.sim.fiber_broken = wp.zeros(len(all_i), dtype=int)
         self.sim.n_bonds = len(all_i)
 
     # ------------------------------------------------------------------
