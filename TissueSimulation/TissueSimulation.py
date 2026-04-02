@@ -1282,10 +1282,10 @@ class TissueSimulationTest(ScriptedLoadableModuleTest):
         f"Gravity OK — tissue mean Z disp: {z_disp_free.mean()*1000:.2f} mm, "
         f"bone max disp: {bone_disp*1e6:.1f} µm", 600)
 
-    # --- 6. Apply tissue pre-stress so cuts gape open ---
-    sim.sim.set_prestress(stretch=1.03)   # 3% isotropic pre-tension
-
-    # --- 7. Launch interactive visualisation + gravity slider ---
+    # --- 6. Launch interactive visualisation + gravity slider ---
+    # Note: pre-stress (set_prestress) is disabled for now — it creates
+    # an F/position mismatch that causes UL mode to diverge.  Proper
+    # pre-tension should be done by scaling fiber rest lengths instead.
     sim.run()
     slicer.app.processEvents()
 
