@@ -567,7 +567,6 @@ def _g2p_cut(
     new_C = wp.mat33(0.0, 0.0, 0.0,
                      0.0, 0.0, 0.0,
                      0.0, 0.0, 0.0)
-    w_total = float(0.0)
 
     for di in range(3):
         wx = _bspline_w(fx_x, di)
@@ -594,12 +593,11 @@ def _g2p_cut(
                 dpos = xi - xp
                 new_v = new_v + w * vi
                 new_C = new_C + (4.0 * inv_dx * inv_dx * w) * wp.outer(vi, dpos)
-                w_total = w_total + w
 
-    # Renormalize if some nodes were skipped (weight < 1)
-    if w_total > 0.01:
-        new_v = new_v / w_total
-        new_C = new_C / w_total
+    # No weight renormalization — following CRESSim-MPM (Ou & Tavakoli 2025).
+    # Particles near the cut receive less total weight because some nodes
+    # are blocked.  This correctly reduces their velocity rather than
+    # amplifying from the surviving nodes.
 
     I3 = wp.mat33(1.0, 0.0, 0.0,
                   0.0, 1.0, 0.0,
