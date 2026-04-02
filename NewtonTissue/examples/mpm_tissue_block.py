@@ -30,14 +30,17 @@ GRAVITY    = np.array([0.0, -9.8, 0.0])
 #   k_collagen  — 0.25 N/m tension-only; effective modulus ~48 kPa at 5% post-crimp
 #                 (Krouskop 1998 high-strain glandular: 100–220 kPa with dense stroma).
 #   crimp=0.05  — 5% toe region (Frontiers Materials 2021: 2–10% for soft connective).
-#   k_curve=2   — Laplacian stability spring; limit ~26 N/m at dt=2e-4 s.
-#                 Reduced from 20 → allows ~20 mm probe deflection at 50 kPa
-#                 (k_curve=20 was ~100× stiffer than Neo-Hookean, dominated response).
+#   k_curve=0   — disabled: Updated Lagrangian mode handles large deformation correctly;
+#                 the fiber network (elastin+collagen bonds) provides lattice connectivity.
 #   damping     — 0.995: near-critically damped (Q≈1.1) vs overdamped (Q≈0.54 at 0.99).
 MATERIAL         = MPMMaterial(E=10_000.0, nu=0.48, rho=1_060.0,
                                k_elastin=0.05, k_collagen=0.25, collagen_crimp=0.05,
-                               k_curve=2.0)
+                               k_curve=0.0)
 VELOCITY_DAMPING = 0.995
+
+# Probe geometry: rigid sphere contact for displacement-controlled palpation.
+# Sphere radius ≈ fingertip: 4×dx ≈ 10 mm.
+PROBE_RADIUS_DX  = 4.0     # probe radius in multiples of grid spacing
 
 
 class MPMTissueBlock:
@@ -67,6 +70,8 @@ class MPMTissueBlock:
         self.sim.initialize_block_particles(lo=lo, hi=hi, ppc=PPC,
                                             fixed_y_max=float(lo[1]) + 2.0 * self.sim.dx)
 
+        self._probe_radius = PROBE_RADIUS_DX * self.sim.dx   # [m]
+
         pos = self.sim.get_positions()
         center   = BLOCK_SIZE / 2.0
         top_y    = BLOCK_SIZE - 3.0 * self.sim.dx
@@ -78,6 +83,11 @@ class MPMTissueBlock:
         )
         palp_pos = pos[self._palp_mask].mean(axis=0) * 1000.0
         self._palp_pos_mm = palp_pos.copy()
+
+        # The fiducial sits at the tissue surface.  The probe sphere centre
+        # is offset upward by sphere_radius so it just touches the surface
+        # at rest and pushes inward when the fiducial is dragged down.
+        self._surface_y = float(BLOCK_SIZE)   # top of block [m]
 
         self.sim.step(GRAVITY)
         for _ in range(749):  # 750 total: enough for damping=0.995 to reach <10um/tick
@@ -97,8 +107,7 @@ class MPMTissueBlock:
         self._tick_interval_ms      = 50
         self._idle_ticks            = 0
         self._idle_ticks_to_stop    = 5
-        self._probe_params          = None
-        self._probe_ticks_remaining = 0
+        self._contact_sphere        = None    # {'center': [m], 'radius': [m]} or None
         self._prev_tick_pos         = None
         self._observer_tags         = []
 
@@ -181,16 +190,11 @@ class MPMTissueBlock:
             return
 
         for _ in range(self._steps_per_tick):
-            if self._probe_params is not None and self._probe_ticks_remaining > 0:
-                pp = self._probe_params
-                self.sim.step_with_probe(GRAVITY, pp['center'], pp['pressure_pa'],
-                                         pp['normal'], pp['radius'])
+            if self._contact_sphere is not None:
+                cs = self._contact_sphere
+                self.sim.step_with_contact(GRAVITY, cs['center'], cs['radius'])
             else:
                 self.sim.step(GRAVITY)
-        if self._probe_ticks_remaining > 0:
-            self._probe_ticks_remaining -= 1
-            if self._probe_ticks_remaining == 0:
-                self._probe_params = None
 
         pos_now = self.sim.get_positions()
         self.update_model()
@@ -213,17 +217,26 @@ class MPMTissueBlock:
         self.stop_simulation_loop()
 
     # ------------------------------------------------------------------
-    # Palpation
+    # Palpation (displacement-controlled rigid sphere contact)
     # ------------------------------------------------------------------
 
-    def apply_palpation(self, pressure_pa=10_000.0, n_steps=500, show_every=0):
-        self._loop_running = False   # pause loop so timer ticks don't interfere
-        probe_center = self._palp_pos_mm / 1000.0
-        probe_normal = np.array([0.0, -1.0, 0.0])
-        probe_radius = 10.0 * self.sim.dx
+    def _sphere_center_for_fiducial(self, fiducial_pos_m):
+        """Compute rigid sphere centre from fiducial position.
+
+        The sphere centre sits one radius above the fiducial so that at rest
+        (fiducial at tissue surface) the sphere just touches the surface.
+        """
+        return fiducial_pos_m + np.array([0.0, self._probe_radius, 0.0])
+
+    def apply_palpation(self, push_depth_m=0.015, n_steps=500, show_every=0):
+        """Push a rigid sphere into tissue by push_depth_m, then hold."""
+        self._loop_running = False
+        rest_m = self._palp_pos_mm / 1000.0
         for i in range(n_steps):
-            self.sim.step_with_probe(GRAVITY, probe_center, pressure_pa,
-                                     probe_normal, probe_radius)
+            frac = min(1.0, (i + 1) / n_steps)
+            fid_pos = rest_m + np.array([0.0, -push_depth_m * frac, 0.0])
+            sphere_c = self._sphere_center_for_fiducial(fid_pos)
+            self.sim.step_with_contact(GRAVITY, sphere_c, self._probe_radius)
             if show_every > 0 and i % show_every == show_every - 1:
                 self.update_model()
                 try:
@@ -233,7 +246,9 @@ class MPMTissueBlock:
                     pass
 
     def recover(self, n_steps=1500, show_every=5):
-        self._loop_running = False   # pause loop during scripted recovery
+        """Release probe and let tissue recover elastically."""
+        self._loop_running = False
+        self._contact_sphere = None
         for i in range(n_steps):
             self.sim.step(GRAVITY)
             if show_every > 0 and i % show_every == show_every - 1:
@@ -365,28 +380,22 @@ class MPMTissueBlock:
 
         if dist_mm < 0.5:
             # Probe returned to rest — release contact
-            self._probe_params          = None
-            self._probe_ticks_remaining = 0
-            self._idle_ticks            = 0
+            self._contact_sphere = None
+            self._idle_ticks     = 0
             if not self._loop_running:
                 self.start_simulation_loop()
             return
 
-        # Constant contact pressure — finger presses tissue at fiducial position.
-        # 200 kPa with corrected body-force formula (P × 3/(4ρR)) and k_curve=2
-        # gives ~15 mm deflection at the probe centre (empirically validated).
-        # Stability limit ≈ 540 kPa — safely below.
-        contact_pressure_pa = 200_000.0
-
-        self._probe_params = {
-            'center':      p_mm / 1000.0,        # probe IS at fiducial position
-            'pressure_pa': contact_pressure_pa,
-            'normal':      delta_mm / dist_mm,   # push direction = into tissue
-            'radius':      10.0 * self.sim.dx,
+        # Displacement-controlled rigid sphere contact.
+        # The sphere centre is offset upward by probe_radius from the fiducial
+        # so it just touches the tissue surface at rest.  Dragging the fiducial
+        # into the tissue pushes the sphere in, displacing particles.
+        fid_pos_m = p_mm / 1000.0
+        sphere_c  = self._sphere_center_for_fiducial(fid_pos_m)
+        self._contact_sphere = {
+            'center': sphere_c,
+            'radius': self._probe_radius,
         }
-        ticks_per_second = 1000 // self._tick_interval_ms
-        # Keep probe on while finger is in tissue; user returns fiducial to rest to release.
-        self._probe_ticks_remaining = 30 * ticks_per_second
         self._palp_pos_mm  = p_mm
         self._palp_ref_pos = p_mm
         self._idle_ticks   = 0

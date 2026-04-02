@@ -10,3 +10,4 @@ __pycache__/
 .mcp.json
 *.code-workspace
 Experiments/
+NewtonTissue/tests/artifacts/CTHead.nrrd

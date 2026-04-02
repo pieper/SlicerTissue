@@ -53,7 +53,7 @@ class TissueSimulationWidget(ScriptedLoadableModuleWidget):
     parametersFormLayout = qt.QFormLayout(parametersCollapsibleButton)
 
     # reload and run specific tests
-    scenarios = ("OneElement", "GluedBeam", "TwoElements", "Slab", "Subdivision", "Stack3Compare", "Newton", "MPM", "LayeredTissueHex", "LayeredAnisotropicTissue", "ResolutionCompare", "WarpMPM")
+    scenarios = ("OneElement", "GluedBeam", "TwoElements", "Slab", "Subdivision", "Stack3Compare", "Newton", "MPM", "LayeredTissueHex", "LayeredAnisotropicTissue", "ResolutionCompare", "WarpMPM", "CTHeadMPM")
     for scenario in scenarios:
       button = qt.QPushButton("Reload and Test %s" % scenario)
       button.toolTip = "Reload this module and then run the %s self test." % scenario
@@ -281,6 +281,8 @@ class TissueSimulationTest(ScriptedLoadableModuleTest):
       self.test_ResolutionCompare()
     elif scenario == "WarpMPM":
       self.test_WarpMPM()
+    elif scenario == "CTHeadMPM":
+      self.test_CTHeadMPM()
     else:
       self.delayDisplay(f"Unknown test scenario: {scenario}", 3000)
       self.fail(f"Unknown test scenario: {scenario}")
@@ -1101,27 +1103,25 @@ class TissueSimulationTest(ScriptedLoadableModuleTest):
         f"Gravity OK — free mean Y: {y_disp_free.mean()*1000:.2f} mm, "
         f"fixed max Y: {abs(y_disp_fixed).max()*1e6:.1f} µm", 600)
 
-    # --- 2. Slow pressure ramp via simulation loop ---
-    # Ramp 0 → 200 kPa over 100 levels × 150 ms each (15 s total).
-    # The Qt event loop runs freely so the sim timer fires at its normal 50 ms
-    # cadence (~3 ticks / level), letting the tissue respond at each increment.
+    # --- 2. Displacement-controlled push via simulation loop ---
+    # Ramp probe sphere 0 → 15 mm into tissue over 60 levels × 150 ms each.
+    # The rigid sphere contact pushes particles radially outward, creating a
+    # smooth bowl-shaped depression like a real finger pressing into tissue.
     self.delayDisplay("Pressing finger into tissue...", 400)
     import qt as _qt
-    max_pressure_pa = 200_000.0
-    n_ramp      = 100   # pressure levels
-    ms_per_level = 150  # ms between increments (sim loop fires freely)
-    probe_center = sim._palp_pos_mm / 1000.0
-    probe_normal = numpy.array([0.0, -1.0, 0.0])
+    push_depth_m = 0.015    # 15 mm total push
+    n_ramp       = 60       # displacement levels
+    ms_per_level = 150      # ms between increments (sim loop fires freely)
+    rest_pos_m   = sim._palp_pos_mm / 1000.0
 
     for i in range(n_ramp):
-      pressure = max_pressure_pa * (i + 1) / n_ramp
-      sim._probe_params = {
-        'center':      probe_center,
-        'pressure_pa': pressure,
-        'normal':      probe_normal,
-        'radius':      10.0 * sim.sim.dx,
+      depth = push_depth_m * (i + 1) / n_ramp
+      fid_pos = rest_pos_m + numpy.array([0.0, -depth, 0.0])
+      sphere_c = sim._sphere_center_for_fiducial(fid_pos)
+      sim._contact_sphere = {
+        'center': sphere_c,
+        'radius': sim._probe_radius,
       }
-      sim._probe_ticks_remaining = 9999  # keep probe active
       sim._idle_ticks = 0
       if not sim._loop_running:
         sim.start_simulation_loop()
@@ -1134,25 +1134,160 @@ class TissueSimulationTest(ScriptedLoadableModuleTest):
                   - pos_settled[sim._palp_mask, 1].mean()) * 1000.0
     self.assertLess(dy_push_mm, -1.0,
                     f"Push should move palpation region ≥1 mm downward, got {dy_push_mm:.3f} mm")
-    self.delayDisplay(
-        f"Finger at {abs(dy_push_mm):.1f} mm depth — pressure released.", 1500)
 
-    # --- 3. Finger lifts off — tissue recovers elastically ---
-    sim._probe_params = None
-    sim._probe_ticks_remaining = 0
+    # Check smoothness: particles near (but outside) the contact zone should
+    # also have moved somewhat — unlike a cookie-cutter stamp.
+    center_xz = numpy.array([0.04, 0.04])  # block centre in xz
+    r_xz = numpy.sqrt((pos_pushed[:, 0] - center_xz[0])**2 +
+                       (pos_pushed[:, 2] - center_xz[1])**2)
+    near_mask = (r_xz > sim._probe_radius) & (r_xz < 2.0 * sim._probe_radius) & free_mask
+    if near_mask.sum() > 0:
+      dy_near_mm = (pos_pushed[near_mask, 1].mean()
+                    - pos_settled[near_mask, 1].mean()) * 1000.0
+      self.assertLess(dy_near_mm, -0.1,
+                      f"Surrounding tissue should deform too (smooth contact), got {dy_near_mm:.3f} mm")
+      self.delayDisplay(
+          f"Push: palp region {abs(dy_push_mm):.1f} mm, surround {abs(dy_near_mm):.1f} mm", 800)
+    else:
+      self.delayDisplay(f"Push: palp region {abs(dy_push_mm):.1f} mm", 800)
+
+    self.delayDisplay(
+        f"Finger at {abs(dy_push_mm):.1f} mm depth — releasing.", 1500)
+
+    # --- 3. Finger lifts off gradually (like a real finger) ---
+    # Ramp sphere back out over 30 levels so F tracks the withdrawal.
+    n_withdraw = 30
+    for i in range(n_withdraw):
+      frac = 1.0 - (i + 1) / n_withdraw
+      depth = push_depth_m * frac
+      fid_pos = rest_pos_m + numpy.array([0.0, -depth, 0.0])
+      sphere_c = sim._sphere_center_for_fiducial(fid_pos)
+      sim._contact_sphere = {
+        'center': sphere_c,
+        'radius': sim._probe_radius,
+      }
+      sim._idle_ticks = 0
+      if not sim._loop_running:
+        sim.start_simulation_loop()
+      _loop = _qt.QEventLoop()
+      _qt.QTimer.singleShot(ms_per_level, _loop.quit)
+      _loop.exec_()
+
+    sim._contact_sphere = None
     sim.recover(n_steps=2000, show_every=5)
 
     # --- 4. Check elastic recovery ---
     pos_recovered = sim.sim.get_positions().copy()
     residual_mm = (numpy.abs(pos_recovered[free_mask]
                              - pos_settled[free_mask]).max() * 1000.0)
-    self.assertLess(residual_mm, 20.0,
-                    f"Elastic recovery should leave <20 mm residual, got {residual_mm:.2f} mm")
+    self.assertLess(residual_mm, 5.0,
+                    f"Elastic recovery should leave <5 mm residual, got {residual_mm:.2f} mm")
     self.delayDisplay(
         f"Recovery — max residual displacement: {residual_mm:.2f} mm", 1000)
 
     slicer.mpmSim = sim
     self.delayDisplay('WarpMPM push-pull test passed!')
+
+  def test_CTHeadMPM(self):
+    """CT-driven MPM simulation: particles classified by HU, gravity slider.
+
+    Loads the CTHead dataset and creates an MPM simulation where bone
+    particles are fixed, air is skipped, and soft tissue deforms under
+    gravity.  A toolbar slider controls gravity magnitude (−2 g … +2 g).
+    """
+    self.delayDisplay("Starting CTHeadMPM test", 200)
+
+    import importlib.util
+    if importlib.util.find_spec("warp") is None:
+      self.delayDisplay("warp not available — skipping CTHeadMPM test", 2000)
+      return
+
+    import os, sys, importlib.util
+
+    scriptPath = os.path.join(
+        os.path.dirname(os.path.dirname(__file__)),
+        "NewtonTissue", "examples", "mpm_ct_head.py")
+    if not os.path.exists(scriptPath):
+      self.fail(f"mpm_ct_head.py not found at {scriptPath}")
+
+    examplesDir = os.path.dirname(scriptPath)
+    srcDir = os.path.join(os.path.dirname(examplesDir), 'src')
+    for d in [examplesDir, srcDir]:
+      if d not in sys.path:
+        sys.path.insert(0, d)
+
+    for k in [k for k in sys.modules
+              if 'newton_tissue.mpm' in k or 'mpm_ct_head' in k]:
+      del sys.modules[k]
+
+    spec = importlib.util.spec_from_file_location("mpm_ct_head", scriptPath)
+    mod  = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    # --- 1. Download / cache CTHead volume ---
+    self.delayDisplay("Downloading CTHead (cached after first run)…", 400)
+    nrrd_path = mod.download_ct_head()
+    self.assertTrue(os.path.exists(nrrd_path),
+                    f"CTHead file not found at {nrrd_path}")
+
+    # --- 2. Load into Slicer ---
+    self.delayDisplay("Loading CTHead volume…", 400)
+    volume_node = slicer.util.loadVolume(nrrd_path)
+    self.assertIsNotNone(volume_node, "Failed to load CTHead volume")
+
+    # --- 3. Stop any previous MPM sim ---
+    if hasattr(slicer, 'mpmSim') and slicer.mpmSim is not None:
+      try:
+        slicer.mpmSim.stop_simulation_loop()
+        if hasattr(slicer.mpmSim, 'cleanup_toolbar'):
+          slicer.mpmSim.cleanup_toolbar()
+      except Exception:
+        pass
+      slicer.mpmSim = None
+
+    # Clean up any previous MPMCTHead model nodes
+    nodes = slicer.mrmlScene.GetNodesByName('MPMCTHead')
+    for i in range(nodes.GetNumberOfItems()):
+      node = nodes.GetItemAsObject(i)
+      if node:
+        slicer.mrmlScene.RemoveNode(node)
+
+    # --- 4. Create MPM simulation (4 mm grid for practical speed) ---
+    self.delayDisplay("Building MPM simulation from CT…", 400)
+    sim = mod.MPMCTHead(volume_node, dx_mm=4.0, ppc=2)
+
+    free_mask  = ~sim.sim.fixed.numpy().astype(bool)
+    fixed_mask =  sim.sim.fixed.numpy().astype(bool)
+    n_free  = int(free_mask.sum())
+    n_fixed = int(fixed_mask.sum())
+    self.delayDisplay(
+        f"{sim.sim.n_particles} particles — {n_free} tissue, {n_fixed} bone, "
+        f"device={sim.device}", 600)
+
+    # --- 5. Verify gravity settlement ---
+    pos0 = sim.sim.x0.numpy().copy()
+    pos_settled = sim.sim.get_positions().copy()
+
+    # Tissue particles should have moved under gravity (−S = −Z in sim)
+    z_disp_free = pos_settled[free_mask, 2] - pos0[free_mask, 2]
+    self.assertLess(z_disp_free.mean(), -1e-6,
+                    "Free tissue should settle downward (−S) under gravity")
+
+    # Bone particles must not move
+    bone_disp = numpy.abs(pos_settled[fixed_mask] - pos0[fixed_mask]).max()
+    self.assertAlmostEqual(float(bone_disp), 0.0, places=6,
+                           msg="Bone particles must stay fixed")
+
+    self.delayDisplay(
+        f"Gravity OK — tissue mean Z disp: {z_disp_free.mean()*1000:.2f} mm, "
+        f"bone max disp: {bone_disp*1e6:.1f} µm", 600)
+
+    # --- 6. Launch interactive visualisation + gravity slider ---
+    sim.run()
+    slicer.app.processEvents()
+
+    slicer.mpmSim = sim
+    self.delayDisplay('CTHeadMPM test passed — drag the gravity slider!')
 
   def test_ResolutionCompare(self):
     """Compare Low / Medium / High mesh resolution on the same anisotropic tissue.
