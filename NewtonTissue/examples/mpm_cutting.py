@@ -128,12 +128,14 @@ def build_scalpel_sdf(sim, curve_points_ras_mm, depth_mm=20.0,
         d_along = v @ seg_dir
         near_segment = (d_along > -2 * dx) & (d_along < seg_len + 2 * dx)
 
-        # Active = within depth range AND near the segment.
-        # NO lateral distance limit — we assign a side to ALL nodes
-        # that are within the ribbon's extent, regardless of how far
-        # they are from the cutting plane.  This ensures tissue on
-        # both sides of the cut gets proper side assignment.
-        active = in_depth & near_segment
+        # Lateral limit: extend the side assignment to depth_m on
+        # each side of the cutting plane.  This creates a slab thick
+        # enough to capture tissue on both sides without extending
+        # across the entire volume.
+        d_lateral = np.abs(d_normal)
+        near_cut = d_lateral < depth_m
+
+        active = in_depth & near_segment & near_cut
 
         # The SDF value is the signed normal distance from the cut plane.
         # Positive = one side, negative = the other.
