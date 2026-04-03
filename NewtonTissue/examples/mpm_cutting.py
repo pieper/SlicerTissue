@@ -119,26 +119,29 @@ def build_scalpel_sdf(sim, curve_points_ras_mm, depth_mm=20.0,
         # that are within the ribbon's depth range and close to the polyline.
         # Nodes far from the ribbon get large positive SDF (unaffected).
 
-        # Distance from the ribbon (unsigned, in the tangent plane)
-        d_lateral = np.abs(d_normal)
-
         # Within the ribbon's depth range?
-        # The ribbon starts at the curve (d_depth=0) and goes to d_depth=-depth_m
+        # The ribbon starts at the curve (d_depth=0) and goes down by depth_m
         in_depth = (d_depth > -depth_m - dx) & (d_depth < dx)
 
-        # Close to the polyline laterally?
-        near_cut = d_lateral < 4 * dx  # influence range
+        # Distance along the segment axis: only affect nodes near the
+        # polyline (within half a segment length + margin at each end)
+        d_along = v @ seg_dir
+        near_segment = (d_along > -2 * dx) & (d_along < seg_len + 2 * dx)
 
-        active = in_depth & near_cut
+        # Active = within depth range AND near the segment.
+        # NO lateral distance limit — we assign a side to ALL nodes
+        # that are within the ribbon's extent, regardless of how far
+        # they are from the cutting plane.  This ensures tissue on
+        # both sides of the cut gets proper side assignment.
+        active = in_depth & near_segment
 
-        # For active nodes, the SDF is the signed normal distance
-        # (positive on one side, negative on the other)
+        # The SDF value is the signed normal distance from the cut plane.
+        # Positive = one side, negative = the other.
         candidate_sdf = d_normal
-        # For inactive nodes, keep the large positive default
 
         # Update SDF: for active nodes, take the value with smallest
-        # absolute distance.  Nodes that haven't been assigned yet (sdf=0)
-        # always get overwritten by the first active value.
+        # absolute distance (closest to the cut surface).  Nodes that
+        # haven't been assigned yet (sdf=0) always get overwritten.
         unassigned = active & (sdf == 0.0)
         closer = active & (sdf != 0.0) & (np.abs(candidate_sdf) < np.abs(sdf))
         sdf[unassigned | closer] = candidate_sdf[unassigned | closer]
