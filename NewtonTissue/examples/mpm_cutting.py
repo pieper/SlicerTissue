@@ -167,10 +167,11 @@ def build_scalpel_sdf(sim, curve_points_ras_mm, depth_mm=20.0,
         d_along = v @ seg_dir
         near_segment = (d_along > -2 * dx) & (d_along < seg_len + 2 * dx)
 
-        # Lateral limit: assign sides up to depth_m from the cut plane
-        near_cut = np.abs(d_normal) < depth_m
-
-        active = in_depth & near_segment & near_cut
+        # No lateral limit — every node in the depth/segment range must
+        # get a side assignment.  Otherwise, nodes >1-2 cells from the
+        # cut plane stay at SDF=0 (neutral) and let momentum transfer
+        # across the cut freely, defeating the purpose of the cut.
+        active = in_depth & near_segment
         candidate_sdf = d_normal
 
         # Keep the value closest to the cut surface per node
