@@ -501,6 +501,19 @@ class MPMCTHead:
         if self.vtk_model:
             self.vtk_model.GetPolyData().Modified()
 
+    def rebuild_colors(self):
+        """Rebuild particle colors (e.g. after a cut to show sides)."""
+        if self._vtk_poly is None:
+            return
+        import vtk, vtk.util.numpy_support as ns
+        colors_np = self._build_colors()
+        ca = ns.numpy_to_vtk(colors_np, deep=True, array_type=vtk.VTK_UNSIGNED_CHAR)
+        ca.SetName("Colors"); ca.SetNumberOfComponents(3)
+        self._vtk_poly.GetPointData().SetScalars(ca)
+        self._vtk_poly.Modified()
+        if self.vtk_model:
+            self.vtk_model.GetPolyData().Modified()
+
     def _build_colors(self):
         """Bone=ivory, tissue=HU gradient, cut sides=red/blue."""
         n = self.sim.n_particles

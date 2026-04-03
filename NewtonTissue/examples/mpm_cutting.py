@@ -239,6 +239,10 @@ class CurveObserver:
         if sdf is not None:
             self.mpm_wrapper.sim.apply_cut(sdf)
 
+            # Update particle colors to show cut sides
+            if hasattr(self.mpm_wrapper, 'rebuild_colors'):
+                self.mpm_wrapper.rebuild_colors()
+
             # Restart the simulation loop if it was idle
             if hasattr(self.mpm_wrapper, '_loop_running'):
                 self.mpm_wrapper._idle_ticks = 0
