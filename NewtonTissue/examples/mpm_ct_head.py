@@ -591,6 +591,13 @@ class MPMCTHead:
     def _create_gravity_slider(self):
         import qt, slicer
 
+        # Remove any leftover gravity toolbars from previous runs
+        main_window = slicer.util.mainWindow()
+        for tb in main_window.findChildren(qt.QToolBar):
+            if tb.windowTitle == "MPM Gravity":
+                main_window.removeToolBar(tb)
+                tb.deleteLater()
+
         self._toolbar = qt.QToolBar("MPM Gravity")
         slicer.util.mainWindow().addToolBar(self._toolbar)
 
