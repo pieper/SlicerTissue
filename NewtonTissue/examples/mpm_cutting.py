@@ -51,48 +51,34 @@ def build_scalpel_sdf(sim, curve_points_ras_mm, depth_mm=20.0,
     if len(pts_m) < 2:
         return np.zeros(ng**3, dtype=np.float32)
 
-    # Compute the cut plane.  The cut surface is defined by:
-    #   - The curve path (a polyline in 3D)
-    #   - An extrusion direction (depth direction, typically inferior = -Z in RAS)
-    # The "side" is determined by the cross product of the curve tangent
-    # and the depth direction, giving a normal to the cutting ribbon.
+    # The cut surface is a ribbon defined by:
+    #   - The curve path (a polyline in 3D on the tissue surface)
+    #   - An extrusion into the tissue (depth direction)
+    # The "side" is determined by cross(tangent, depth_dir), giving a
+    # normal that separates left and right of the cutting ribbon.
+    #
+    # depth_dir must point OUTWARD from the tissue surface (away from
+    # the body interior).  The in_depth check then admits grid nodes
+    # with negative d_depth (= into tissue) up to depth_m.
+    #
+    # When a bone SDF is available, depth_dir is derived per-segment
+    # from the bone SDF gradient, which naturally points outward.
 
-    # Curve tangent: average of segment directions
-    segments = np.diff(pts_m, axis=0)          # (N-1, 3)
-    tangent = segments.mean(axis=0)
-    tangent /= max(np.linalg.norm(tangent), 1e-12)
-
-    # Depth direction: default to -Z (inferior in RAS sim coords)
-    depth_dir = np.array([0.0, 0.0, -1.0])
-
-    # Cut plane normal: perpendicular to both tangent and depth
-    if cut_normal is None:
-        cut_normal = np.cross(tangent, depth_dir)
-        norm = np.linalg.norm(cut_normal)
-        if norm < 1e-6:
-            # Tangent parallel to depth — use a fallback
-            cut_normal = np.cross(tangent, np.array([1.0, 0.0, 0.0]))
-            norm = np.linalg.norm(cut_normal)
-        cut_normal /= norm
-
-    # Build the SDF on the grid: signed distance from each grid node
-    # to the cutting ribbon (polyline + depth extrusion).
-    # For each grid node, project onto the nearest point on the polyline,
-    # check depth, and compute signed distance using cut_normal.
+    # Bone SDF gradient for local surface normal estimation
+    bone_grad_np = None
+    if hasattr(sim, 'bone_sdf_grad') and sim.bone_sdf_grad is not None:
+        bone_grad_np = sim.bone_sdf_grad.numpy()  # (ng^3, 3)
 
     # Grid node positions
     gi = np.arange(ng, dtype=np.float32)
     gx, gy, gz = np.meshgrid(gi * dx, gi * dx, gi * dx, indexing='ij')
     grid_pos = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=1)  # (ng^3, 3)
 
-    # For each grid node, find distance to the cutting ribbon.
-    # Default 0.0 = not near any cut.  The side check in _p2g_cut/_g2p_cut
-    # uses sign(p_sdf) * sign(g_sdf) < 0 to block transfers.  Zero means
-    # "neutral" — transfers are never blocked for zero-SDF nodes.
     sdf = np.zeros(ng**3, dtype=np.float32)
-
-    # Process each segment of the polyline
     depth_m = depth_mm / 1000.0
+
+    ref_cut_normal = None   # first segment sets the reference sign
+
     for seg_idx in range(len(pts_m) - 1):
         p0 = pts_m[seg_idx]
         p1 = pts_m[seg_idx + 1]
@@ -102,52 +88,91 @@ def build_scalpel_sdf(sim, curve_points_ras_mm, depth_mm=20.0,
             continue
         seg_dir = seg / seg_len
 
-        # Project grid nodes onto this segment
-        v = grid_pos - p0                       # (ng^3, 3)
+        # --- Per-segment depth direction (outward from tissue) --------
+        if cut_normal is not None:
+            # User-supplied side normal: derive depth_dir from it
+            local_depth = np.cross(cut_normal, seg_dir)
+            nrm = np.linalg.norm(local_depth)
+            if nrm < 1e-6:
+                local_depth = np.array([0.0, 0.0, 1.0])
+            else:
+                local_depth = local_depth / nrm
+            local_normal = cut_normal.copy()
+        elif bone_grad_np is not None:
+            # Sample bone SDF gradient at segment midpoint.
+            # The gradient points away from bone — approximately the
+            # outward surface normal of the body at that location.
+            mid = (p0 + p1) / 2.0
+            mi = np.clip(int(round(mid[0] * inv_dx)), 0, ng - 1)
+            mj = np.clip(int(round(mid[1] * inv_dx)), 0, ng - 1)
+            mk = np.clip(int(round(mid[2] * inv_dx)), 0, ng - 1)
+            flat_idx = mi * ng * ng + mj * ng + mk
+            grad = bone_grad_np[flat_idx]
+            nrm = np.linalg.norm(grad)
+            if nrm > 1e-6:
+                local_depth = grad / nrm       # outward from bone/tissue
+            else:
+                local_depth = np.array([0.0, 0.0, 1.0])  # fallback
+
+            local_normal = np.cross(seg_dir, local_depth)
+            nrm = np.linalg.norm(local_normal)
+            if nrm < 1e-6:
+                local_normal = np.cross(seg_dir, np.array([1.0, 0.0, 0.0]))
+                nrm = np.linalg.norm(local_normal)
+            local_normal = local_normal / nrm
+        else:
+            # No bone SDF available — use +Z (superior in RAS = outward
+            # on the top of the head).  Correct only for vertex cuts.
+            local_depth = np.array([0.0, 0.0, 1.0])
+            local_normal = np.cross(seg_dir, local_depth)
+            nrm = np.linalg.norm(local_normal)
+            if nrm < 1e-6:
+                local_normal = np.cross(seg_dir, np.array([1.0, 0.0, 0.0]))
+                nrm = np.linalg.norm(local_normal)
+            local_normal = local_normal / nrm
+
+        # Ensure consistent cut_normal sign across all segments so
+        # the positive/negative side assignment doesn't flip mid-cut.
+        if ref_cut_normal is None:
+            ref_cut_normal = local_normal.copy()
+        elif np.dot(local_normal, ref_cut_normal) < 0:
+            local_normal = -local_normal
+
+        if seg_idx == 0:
+            print(f"  seg[0] depth_dir={local_depth}, "
+                  f"cut_normal={local_normal}")
+
+        # --- Compute SDF for this segment ----------------------------
+        v = grid_pos - p0                          # (ng^3, 3)
         t = np.clip(v @ seg_dir / seg_len, 0, 1)  # parametric position
-        proj = p0 + np.outer(t, seg)            # nearest point on segment
+        proj = p0 + np.outer(t, seg)               # nearest point on segment
+        delta = grid_pos - proj                    # (ng^3, 3)
 
-        # Vector from projection to grid node
-        delta = grid_pos - proj                 # (ng^3, 3)
+        d_normal = delta @ local_normal            # signed side distance
+        d_depth  = delta @ local_depth             # >0 = outward, <0 = into tissue
 
-        # Decompose into: along cut_normal, along depth_dir, remaining
-        d_normal = delta @ cut_normal           # signed distance across cut plane
-        d_depth  = delta @ depth_dir            # distance along depth direction
-
-        # The cut ribbon extends from the surface down by depth_m.
-        # We want the SDF to be signed (by cut_normal) only for nodes
-        # that are within the ribbon's depth range and close to the polyline.
-        # Nodes far from the ribbon get large positive SDF (unaffected).
-
-        # Within the ribbon's depth range?
-        # The ribbon starts at the curve (d_depth=0) and goes down by depth_m
+        # The ribbon starts at the curve (d_depth≈0) and extends into
+        # the tissue (d_depth < 0) by depth_m.  Allow margin dx.
         in_depth = (d_depth > -depth_m - dx) & (d_depth < dx)
 
-        # Distance along the segment axis: only affect nodes near the
-        # polyline (within half a segment length + margin at each end)
         d_along = v @ seg_dir
         near_segment = (d_along > -2 * dx) & (d_along < seg_len + 2 * dx)
 
-        # Lateral limit: extend the side assignment to depth_m on
-        # each side of the cutting plane.  This creates a slab thick
-        # enough to capture tissue on both sides without extending
-        # across the entire volume.
-        d_lateral = np.abs(d_normal)
-        near_cut = d_lateral < depth_m
+        # Lateral limit: assign sides up to depth_m from the cut plane
+        near_cut = np.abs(d_normal) < depth_m
 
         active = in_depth & near_segment & near_cut
-
-        # The SDF value is the signed normal distance from the cut plane.
-        # Positive = one side, negative = the other.
         candidate_sdf = d_normal
 
-        # Update SDF: for active nodes, take the value with smallest
-        # absolute distance (closest to the cut surface).  Nodes that
-        # haven't been assigned yet (sdf=0) always get overwritten.
+        # Keep the value closest to the cut surface per node
         unassigned = active & (sdf == 0.0)
         closer = active & (sdf != 0.0) & (np.abs(candidate_sdf) < np.abs(sdf))
         sdf[unassigned | closer] = candidate_sdf[unassigned | closer]
 
+    n_pos = int((sdf > 0).sum())
+    n_neg = int((sdf < 0).sum())
+    print(f"build_scalpel_sdf: {n_pos} pos, {n_neg} neg, "
+          f"{ng**3 - n_pos - n_neg} neutral grid nodes")
     return sdf
 
 
