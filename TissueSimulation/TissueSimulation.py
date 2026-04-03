@@ -1289,6 +1289,9 @@ class TissueSimulationTest(ScriptedLoadableModuleTest):
     sim.run()
     slicer.app.processEvents()
 
+    # --- 7. Add SDF volumes for visual inspection ---
+    self._add_sdf_volumes(sim, volume_node)
+
     # --- 8. Set up curve observer for interactive cutting ---
     # When the user draws an open curve markup, a scalpel cut is
     # automatically applied along that path down to bone depth.
@@ -1304,6 +1307,64 @@ class TissueSimulationTest(ScriptedLoadableModuleTest):
 
     slicer.mpmSim = sim
     self.delayDisplay('CTHeadMPM test passed — use gravity slider and draw curves to cut!')
+
+  def _add_sdf_volumes(self, sim, ct_volume_node):
+    """Create SDF scalar volumes resampled onto the CT grid for inspection.
+
+    The bone and tissue SDFs are computed on the coarser MPM grid.  This
+    method resamples them onto the CT volume grid so the IJKToRAS matches
+    exactly, making it easy to overlay on the CT in slice views.
+    """
+    import vtk
+    from scipy.ndimage import map_coordinates
+
+    # CT grid geometry
+    ras2ijk = vtk.vtkMatrix4x4()
+    ct_volume_node.GetRASToIJKMatrix(ras2ijk)
+    ijk2ras = vtk.vtkMatrix4x4()
+    ct_volume_node.GetIJKToRASMatrix(ijk2ras)
+
+    ct_arr = slicer.util.arrayFromVolume(ct_volume_node)  # (K, J, I)
+    nK, nJ, nI = ct_arr.shape
+
+    # Build mapping: CT IJK → MPM grid IJK
+    # CT IJK → RAS: use ijk2ras
+    # RAS mm → sim m: (RAS - offset) / 1000
+    # sim m → MPM grid float index: pos / dx
+    M = numpy.array([[ijk2ras.GetElement(r, c) for c in range(4)]
+                      for r in range(4)])
+    offset_mm = sim._ras_offset_mm
+    dx_m = sim.sim.dx
+
+    # Create index arrays for all CT voxels
+    ii, jj, kk = numpy.meshgrid(
+        numpy.arange(nI), numpy.arange(nJ), numpy.arange(nK),
+        indexing='ij')
+    ijk_flat = numpy.stack([ii.ravel(), jj.ravel(), kk.ravel(),
+                            numpy.ones(nI * nJ * nK)], axis=1)  # (N, 4)
+    ras_flat = (M @ ijk_flat.T).T[:, :3]  # (N, 3)
+    sim_m = (ras_flat - offset_mm) / 1000.0
+    mpm_ijk = sim_m / dx_m  # float grid indices into the MPM SDF
+
+    for name, sdf_3d in [('BoneSDF', getattr(sim, '_bone_sdf_3d', None)),
+                          ('TissueSDF', getattr(sim, '_tissue_sdf_3d', None))]:
+      if sdf_3d is None:
+        continue
+      # Resample MPM SDF onto CT grid using trilinear interpolation
+      # map_coordinates expects (3, N) with coordinates in array order (i,j,k)
+      coords = numpy.stack([mpm_ijk[:, 0], mpm_ijk[:, 1], mpm_ijk[:, 2]])
+      resampled = map_coordinates(sdf_3d, coords, order=1, mode='nearest')
+      # Reshape to CT volume shape (KJI) and convert to mm
+      ct_sdf = (resampled.reshape(nI, nJ, nK) * 1000.0).astype(numpy.float32)
+      ct_sdf_kji = ct_sdf.transpose(2, 1, 0)
+
+      # Remove any old volume with this name
+      old = slicer.mrmlScene.GetFirstNodeByName(name)
+      if old:
+        slicer.mrmlScene.RemoveNode(old)
+
+      vol = slicer.util.addVolumeFromArray(ct_sdf_kji, ijkToRAS=ijk2ras, name=name)
+      vol.GetDisplayNode().SetAutoWindowLevel(True)
 
   def test_ResolutionCompare(self):
     """Compare Low / Medium / High mesh resolution on the same anisotropic tissue.

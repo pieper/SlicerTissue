@@ -49,7 +49,7 @@ def build_scalpel_sdf(sim, curve_points_ras_mm, depth_mm=20.0,
     pts_m = (curve_points_ras_mm - offset_mm) / 1000.0  # shape (N, 3)
 
     if len(pts_m) < 2:
-        return np.zeros(ng**3, dtype=np.float32)
+        return np.zeros(ng**3, dtype=np.float32), []
 
     # The cut surface is a ribbon defined by:
     #   - The curve path (a polyline in 3D on the tissue surface)
@@ -61,13 +61,14 @@ def build_scalpel_sdf(sim, curve_points_ras_mm, depth_mm=20.0,
     # the body interior).  The in_depth check then admits grid nodes
     # with negative d_depth (= into tissue) up to depth_m.
     #
-    # When a bone SDF is available, depth_dir is derived per-segment
-    # from the bone SDF gradient, which naturally points outward.
+    # The outward direction is derived from the tissue body SDF gradient
+    # (computed from the EDT of the tissue+bone occupancy grid).  This
+    # gives the true surface outward normal at each curve point.
 
-    # Bone SDF gradient for local surface normal estimation
-    bone_grad_np = None
-    if hasattr(sim, 'bone_sdf_grad') and sim.bone_sdf_grad is not None:
-        bone_grad_np = sim.bone_sdf_grad.numpy()  # (ng^3, 3)
+    # Tissue body SDF gradient for surface normal estimation
+    tissue_grad_np = None
+    if hasattr(sim, 'tissue_sdf_grad') and sim.tissue_sdf_grad is not None:
+        tissue_grad_np = sim.tissue_sdf_grad.numpy()  # (ng^3, 3)
 
     # Grid node positions
     gi = np.arange(ng, dtype=np.float32)
@@ -78,6 +79,7 @@ def build_scalpel_sdf(sim, curve_points_ras_mm, depth_mm=20.0,
     depth_m = depth_mm / 1000.0
 
     ref_cut_normal = None   # first segment sets the reference sign
+    ribbon_quads = []       # (p0, p1, p1_deep, p0_deep) per segment
 
     for seg_idx in range(len(pts_m) - 1):
         p0 = pts_m[seg_idx]
@@ -98,19 +100,19 @@ def build_scalpel_sdf(sim, curve_points_ras_mm, depth_mm=20.0,
             else:
                 local_depth = local_depth / nrm
             local_normal = cut_normal.copy()
-        elif bone_grad_np is not None:
-            # Sample bone SDF gradient at segment midpoint.
-            # The gradient points away from bone — approximately the
-            # outward surface normal of the body at that location.
+        elif tissue_grad_np is not None:
+            # Sample tissue body SDF gradient at segment midpoint.
+            # The gradient points outward from the tissue surface —
+            # the true surface normal at the curve location.
             mid = (p0 + p1) / 2.0
             mi = np.clip(int(round(mid[0] * inv_dx)), 0, ng - 1)
             mj = np.clip(int(round(mid[1] * inv_dx)), 0, ng - 1)
             mk = np.clip(int(round(mid[2] * inv_dx)), 0, ng - 1)
             flat_idx = mi * ng * ng + mj * ng + mk
-            grad = bone_grad_np[flat_idx]
+            grad = tissue_grad_np[flat_idx]
             nrm = np.linalg.norm(grad)
             if nrm > 1e-6:
-                local_depth = grad / nrm       # outward from bone/tissue
+                local_depth = grad / nrm       # outward from tissue surface
             else:
                 local_depth = np.array([0.0, 0.0, 1.0])  # fallback
 
@@ -121,7 +123,7 @@ def build_scalpel_sdf(sim, curve_points_ras_mm, depth_mm=20.0,
                 nrm = np.linalg.norm(local_normal)
             local_normal = local_normal / nrm
         else:
-            # No bone SDF available — use +Z (superior in RAS = outward
+            # No tissue SDF available — use +Z (superior in RAS = outward
             # on the top of the head).  Correct only for vertex cuts.
             local_depth = np.array([0.0, 0.0, 1.0])
             local_normal = np.cross(seg_dir, local_depth)
@@ -141,6 +143,13 @@ def build_scalpel_sdf(sim, curve_points_ras_mm, depth_mm=20.0,
         if seg_idx == 0:
             print(f"  seg[0] depth_dir={local_depth}, "
                   f"cut_normal={local_normal}")
+
+        # --- Collect ribbon quad geometry (for visualization) ---------
+        # Each segment generates a quad: two points on the surface,
+        # two points at depth.  Store in sim coords [m].
+        ribbon_quads.append((p0.copy(), p1.copy(),
+                             p1 - local_depth * depth_m,
+                             p0 - local_depth * depth_m))
 
         # --- Compute SDF for this segment ----------------------------
         v = grid_pos - p0                          # (ng^3, 3)
@@ -173,7 +182,13 @@ def build_scalpel_sdf(sim, curve_points_ras_mm, depth_mm=20.0,
     n_neg = int((sdf < 0).sum())
     print(f"build_scalpel_sdf: {n_pos} pos, {n_neg} neg, "
           f"{ng**3 - n_pos - n_neg} neutral grid nodes")
-    return sdf
+
+    # Convert ribbon quads from sim coords [m] to RAS mm for visualization
+    ribbon_quads_ras = []
+    for q in ribbon_quads:
+        ribbon_quads_ras.append(tuple(v * 1000.0 + offset_mm for v in q))
+
+    return sdf, ribbon_quads_ras
 
 
 def build_scalpel_sdf_from_curve_node(mpm_wrapper, curve_node,
@@ -203,7 +218,7 @@ def build_scalpel_sdf_from_curve_node(mpm_wrapper, curve_node,
     if hasattr(mpm_wrapper, '_ras_offset_mm'):
         sim._ras_offset_mm = mpm_wrapper._ras_offset_mm
 
-    return build_scalpel_sdf(sim, pts, depth_mm)
+    return build_scalpel_sdf(sim, pts, depth_mm)  # (sdf, ribbon_quads_ras)
 
 
 class CurveObserver:
@@ -260,11 +275,15 @@ class CurveObserver:
               f"({curve_node.GetNumberOfControlPoints()} points, "
               f"depth={self.depth_mm} mm)")
 
-        sdf = build_scalpel_sdf_from_curve_node(
+        result = build_scalpel_sdf_from_curve_node(
             self.mpm_wrapper, curve_node, self.depth_mm)
 
-        if sdf is not None:
+        if result is not None:
+            sdf, ribbon_quads_ras = result
             self.mpm_wrapper.sim.apply_cut(sdf)
+
+            # Create a model of the cut ribbon geometry
+            self._create_cut_model(ribbon_quads_ras, curve_node.GetName())
 
             # Update particle colors to show cut sides
             if hasattr(self.mpm_wrapper, 'rebuild_colors'):
@@ -275,6 +294,46 @@ class CurveObserver:
                 self.mpm_wrapper._idle_ticks = 0
                 if not self.mpm_wrapper._loop_running:
                     self.mpm_wrapper.start_simulation_loop()
+
+    def _create_cut_model(self, ribbon_quads_ras, curve_name):
+        """Create a VTK model node showing the cut ribbon surface."""
+        import slicer
+        import vtk
+
+        points = vtk.vtkPoints()
+        polys  = vtk.vtkCellArray()
+
+        for q in ribbon_quads_ras:
+            base = points.GetNumberOfPoints()
+            for v in q:  # 4 corners of the quad
+                points.InsertNextPoint(float(v[0]), float(v[1]), float(v[2]))
+            quad = vtk.vtkQuad()
+            for i in range(4):
+                quad.GetPointIds().SetId(i, base + i)
+            polys.InsertNextCell(quad)
+
+        poly = vtk.vtkPolyData()
+        poly.SetPoints(points)
+        poly.SetPolys(polys)
+
+        normals = vtk.vtkPolyDataNormals()
+        normals.SetInputData(poly)
+        normals.Update()
+
+        name = f"Cut_{curve_name}"
+        old = slicer.mrmlScene.GetFirstNodeByName(name)
+        if old:
+            slicer.mrmlScene.RemoveNode(old)
+
+        model = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLModelNode', name)
+        model.SetAndObservePolyData(normals.GetOutput())
+        model.CreateDefaultDisplayNodes()
+        dn = model.GetDisplayNode()
+        dn.SetColor(1.0, 1.0, 0.0)  # yellow
+        dn.SetOpacity(0.5)
+        dn.SetBackfaceCulling(False)
+        print(f"CurveObserver: created cut model '{name}' "
+              f"({len(ribbon_quads_ras)} quads)")
 
     def cleanup(self):
         """Remove all observers."""

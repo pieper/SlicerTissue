@@ -241,6 +241,9 @@ class MPMCTHead:
         self._build_bone_grid_mask(pos, is_bone_k)
         self._build_bone_sdf(pos, is_bone_k)
 
+        # --- Tissue surface SDF (for cutting outward-normal estimation) ---
+        self._build_tissue_sdf(pos, is_tissue_k | is_bone_k)
+
         n_bone = int(is_bone_k.sum())
         n_tissue = int(is_tissue_k.sum())
         print(f"MPMCTHead: {n} particles ({n_tissue} tissue, {n_bone} bone), "
@@ -336,9 +339,59 @@ class MPMCTHead:
             self.sim.bone_sdf      = wp.array(sdf_flat,  dtype=float)
             self.sim.bone_sdf_grad = wp.array(grad_flat, dtype=wp.vec3)
 
+        self._bone_sdf_3d = sdf_3d   # (ng, ng, ng) for visualization
         print(f"MPMCTHead: bone SDF built — "
               f"{int(bone_grid.sum())} bone grid nodes, "
               f"SDF range [{sdf_flat.min()*1000:.1f}, {sdf_flat.max()*1000:.1f}] mm")
+
+    def _build_tissue_sdf(self, pos, is_body):
+        """Build a signed distance field of the tissue+bone body surface.
+
+        SDF > 0 outside the body, < 0 inside.  The gradient at the surface
+        points outward — used by build_scalpel_sdf() to orient the cutting
+        ribbon perpendicular to the tissue surface.
+
+        Args:
+            pos:      (n, 3) particle positions [m].
+            is_body:  (n,) bool mask — True for tissue OR bone particles
+                      (everything that forms the solid body).
+        """
+        from scipy.ndimage import distance_transform_edt
+
+        ng     = self.sim.n_grid
+        dx     = self.sim.dx
+        inv_dx = self.sim.inv_dx
+
+        body_grid = np.zeros((ng, ng, ng), dtype=bool)
+        body_pos  = pos[is_body]
+        if len(body_pos) == 0:
+            return
+
+        gi = np.clip(np.round(body_pos[:, 0] * inv_dx).astype(int), 0, ng - 1)
+        gj = np.clip(np.round(body_pos[:, 1] * inv_dx).astype(int), 0, ng - 1)
+        gk = np.clip(np.round(body_pos[:, 2] * inv_dx).astype(int), 0, ng - 1)
+        body_grid[gi, gj, gk] = True
+
+        dist_outside = distance_transform_edt(~body_grid).astype(np.float32) * dx
+        dist_inside  = distance_transform_edt( body_grid).astype(np.float32) * dx
+
+        sdf_3d = np.where(body_grid, -dist_inside, dist_outside)
+
+        # Gradient via central differences (outward normal)
+        grad = np.zeros((ng, ng, ng, 3), dtype=np.float32)
+        grad[1:-1, :, :, 0] = (sdf_3d[2:, :, :] - sdf_3d[:-2, :, :]) / (2.0 * dx)
+        grad[:, 1:-1, :, 1] = (sdf_3d[:, 2:, :] - sdf_3d[:, :-2, :]) / (2.0 * dx)
+        grad[:, :, 1:-1, 2] = (sdf_3d[:, :, 2:] - sdf_3d[:, :, :-2]) / (2.0 * dx)
+
+        grad_flat = grad.reshape(-1, 3).astype(np.float32)
+
+        with wp.ScopedDevice(self.device):
+            self.sim.tissue_sdf_grad = wp.array(grad_flat, dtype=wp.vec3)
+
+        self._tissue_sdf_3d = sdf_3d  # (ng, ng, ng) for visualization
+        print(f"MPMCTHead: tissue SDF built — "
+              f"{int(body_grid.sum())} body grid nodes, "
+              f"SDF range [{sdf_3d.min()*1000:.1f}, {sdf_3d.max()*1000:.1f}] mm")
 
     def _build_bonds(self, lookup, pos, is_tissue, nx, ny, nz, step):
         """Lattice-based fiber bonds between tissue particles."""
