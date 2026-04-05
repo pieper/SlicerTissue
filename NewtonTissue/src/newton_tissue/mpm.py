@@ -1403,6 +1403,36 @@ class MPMSimulator:
             print(f"MPMSimulator: cut applied — {n_broken} bonds broken "
                   f"({len(self.cut_sdfs)} active cuts)")
 
+        # Reset F to identity and update x0 for particles near the cut.
+        # Without this, the Neo-Hookean stress from F tries to restore
+        # the pre-cut shape, pulling cut edges back together.  Resetting
+        # F and x0 to the current state makes the post-cut configuration
+        # the new stress-free reference.
+        sdf_np = cut_sdf_np.astype(np.float32)
+        pos    = self.x.numpy()
+        F_np   = self.F.numpy()
+        x0_np  = self.x0.numpy()
+        fixed  = self.fixed.numpy()
+        inv_dx = float(self.inv_dx)
+        ng     = self.n_grid
+
+        gi = np.clip(np.round(pos[:, 0] * inv_dx).astype(int), 0, ng - 1)
+        gj = np.clip(np.round(pos[:, 1] * inv_dx).astype(int), 0, ng - 1)
+        gk = np.clip(np.round(pos[:, 2] * inv_dx).astype(int), 0, ng - 1)
+        p_sdf = sdf_np[gi * ng * ng + gj * ng + gk]
+
+        near_cut = (np.abs(p_sdf) > 0) & (np.abs(p_sdf) < 3.0 * float(self.dx))
+        near_cut = near_cut & (fixed == 0)
+        n_reset = int(near_cut.sum())
+        if n_reset > 0:
+            F_np[near_cut] = np.eye(3, dtype=np.float32)
+            x0_np[near_cut] = pos[near_cut]
+            with wp.ScopedDevice(self.device):
+                self.F  = wp.array(F_np, dtype=wp.mat33)
+                self.x0 = wp.array(x0_np, dtype=wp.vec3)
+            print(f"MPMSimulator: reset F→I and x0→x for {n_reset} "
+                  f"particles near cut (within {3*self.dx*1000:.0f} mm)")
+
     def set_prestress(self, stretch: float = 1.02):
         """Initialize F with isotropic stretch to create tissue pre-tension.
 

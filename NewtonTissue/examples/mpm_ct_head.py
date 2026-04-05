@@ -582,7 +582,10 @@ class MPMCTHead:
             colors[tissue, 1] = (100 + 80 * t).astype(np.uint8)
             colors[tissue, 2] = (80  + 40 * t).astype(np.uint8)
 
-        # Override near-cut particles with red/blue by side
+        # Override near-cut particles with red/blue by side.
+        # Only color particles within ~25mm of the cut surface (small
+        # |SDF|) — the full SDF extends much further for physics but
+        # the visual indicator should be a narrow band near the cut.
         if self.sim.cut_sdfs:
             cut_sdf_np = self.sim.cut_sdfs[-1].numpy()
             pos = self.sim.get_positions()
@@ -592,8 +595,10 @@ class MPMCTHead:
             gj = np.clip(np.round(pos[:, 1] * inv_dx).astype(int), 0, ng - 1)
             gk = np.clip(np.round(pos[:, 2] * inv_dx).astype(int), 0, ng - 1)
             p_sdf = cut_sdf_np[gi * ng * ng + gj * ng + gk]
-            pos_side = (p_sdf > 0) & self._is_tissue
-            neg_side = (p_sdf < 0) & self._is_tissue
+            color_band = 0.025   # 25mm in sim coords [m]
+            near = np.abs(p_sdf) < color_band
+            pos_side = (p_sdf > 0) & near & self._is_tissue
+            neg_side = (p_sdf < 0) & near & self._is_tissue
             colors[pos_side] = [220, 80, 80]      # red side
             colors[neg_side] = [80, 120, 220]     # blue side
 
