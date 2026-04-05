@@ -1440,45 +1440,63 @@ class MPMSimulator:
                   f"particles near cut (within {3*self.dx*1000:.0f} mm)")
 
         # --- Retraction: displace near-cut particles apart ----------------
+        # Retraction is concentrated in the center of the incision
+        # (cosine-bell weight) so the tissue mechanics naturally produce
+        # a curved opening — wide in the middle, closed at the ends.
         if retract_mm > 0 and retract_steps > 0:
             retract_band = 2.0 * float(self.dx)
             retract_pos = (p_sdf > 0) & (p_sdf < retract_band) & (fixed == 0)
             retract_neg = (p_sdf < 0) & (p_sdf > -retract_band) & (fixed == 0)
+            retract_any = retract_pos | retract_neg
 
-            # Compute the cut normal from the SDF gradient at the cut
-            # surface (direction of maximum SDF change).  Use the average
-            # gradient of near-cut positive particles.
-            sdf_at_pos = p_sdf[retract_pos]
-            pos_pts = pos[retract_pos]
-            if len(pos_pts) > 1:
-                # Approximate cut normal from SDF gradient via finite
-                # differences: direction from neg centroid to pos centroid
-                pos_centroid = pos[retract_pos].mean(axis=0)
-                neg_centroid = pos[retract_neg].mean(axis=0)
-                cut_dir = pos_centroid - neg_centroid
-                cut_dir_norm = float(np.linalg.norm(cut_dir))
-                if cut_dir_norm > 1e-8:
-                    cut_dir = cut_dir / cut_dir_norm
-                else:
-                    cut_dir = np.array([0.0, 0.0, 1.0])
+            if retract_any.sum() < 2:
+                return
+
+            # Retraction direction: pos centroid → neg centroid
+            pos_centroid = pos[retract_pos].mean(axis=0)
+            neg_centroid = pos[retract_neg].mean(axis=0)
+            cut_dir = pos_centroid - neg_centroid
+            cut_dir_norm = float(np.linalg.norm(cut_dir))
+            if cut_dir_norm > 1e-8:
+                cut_dir = cut_dir / cut_dir_norm
             else:
                 cut_dir = np.array([0.0, 0.0, 1.0])
 
-            step_disp = (retract_mm / 1000.0) / retract_steps
+            # Along-curve direction: 1st principal component of
+            # retractor particle positions (longest spread direction)
+            all_retract_pos = pos[retract_any]
+            centered = all_retract_pos - all_retract_pos.mean(axis=0)
+            _, _, Vt = np.linalg.svd(centered, full_matrices=False)
+            curve_axis = Vt[0]  # first principal component
+
+            # Per-particle weight: cosine bell along the curve axis
+            # t=0 at one end, t=1 at the other, max retraction at t=0.5
+            proj = pos @ curve_axis  # all particles
+            proj_min = float(proj[retract_any].min())
+            proj_max = float(proj[retract_any].max())
+            proj_range = max(proj_max - proj_min, 1e-8)
+            t = (proj - proj_min) / proj_range  # 0..1
+
+            # cos²(π(t-0.5)) = 1 at center, 0 at endpoints
+            weight = np.cos(np.pi * (t - 0.5)) ** 2
+            weight = weight.astype(np.float32)
+
+            step_disp_max = (retract_mm / 1000.0) / retract_steps
             gravity_zero = np.array([0.0, 0.0, 0.0])
 
             n_pos_r = int(retract_pos.sum())
             n_neg_r = int(retract_neg.sum())
             for _ in range(retract_steps):
                 x_np = self.x.numpy()
-                x_np[retract_pos] += step_disp * cut_dir
-                x_np[retract_neg] -= step_disp * cut_dir
+                x_np[retract_pos] += (step_disp_max * weight[retract_pos])[:, None] * cut_dir
+                x_np[retract_neg] -= (step_disp_max * weight[retract_neg])[:, None] * cut_dir
                 with wp.ScopedDevice(self.device):
                     self.x = wp.array(x_np, dtype=wp.vec3)
                 self.step(gravity_zero)
 
             print(f"MPMSimulator: retracted {n_pos_r}+{n_neg_r} particles "
-                  f"by ±{retract_mm:.1f} mm over {retract_steps} steps")
+                  f"by ±{retract_mm:.1f} mm (center-weighted) "
+                  f"over {retract_steps} steps")
 
     def set_prestress(self, stretch: float = 1.02):
         """Initialize F with isotropic stretch to create tissue pre-tension.
