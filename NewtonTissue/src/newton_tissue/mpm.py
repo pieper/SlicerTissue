@@ -1436,9 +1436,10 @@ class MPMSimulator:
     def set_prestress(self, stretch: float = 1.02):
         """Initialize F with isotropic stretch to create tissue pre-tension.
 
-        When a cut is made, the pre-stress drives the tissue edges apart,
-        producing a realistic gaping wound.  Typical values: 1.01–1.05
-        (1–5% isotropic pre-stretch).
+        WARNING: modifying F directly creates an F/position mismatch that
+        causes updated-Lagrangian mode to diverge.  Prefer
+        set_prestress_fibers() which achieves tension through the fiber
+        network without corrupting F.
 
         Args:
             stretch:  isotropic stretch ratio (1.0 = no pre-stress).
@@ -1448,6 +1449,34 @@ class MPMSimulator:
         F_np[:] = I_stretched
         with wp.ScopedDevice(self.device):
             self.F = wp.array(F_np, dtype=wp.mat33)
+
+    def set_prestress_fibers(self, stretch: float = 1.05):
+        """Create tissue pre-tension by shortening fiber rest lengths.
+
+        Scales all fiber rest lengths by 1/stretch, making the current
+        particle spacing longer than the rest length.  This creates
+        isotropic tension in the bond network without modifying F or
+        creating any F/position inconsistency.
+
+        When a cut is applied, cross-cut bonds are broken and the
+        tension in surviving bonds pulls the cut edges apart, producing
+        realistic wound gaping.
+
+        Typical values: 1.02–1.10 (2–10% pre-stretch).
+        At 5% with k_elastin=0.05, k_collagen=0.25, this produces
+        moderate tension comparable to skin turgor.
+
+        Args:
+            stretch:  isotropic stretch ratio (1.0 = no pre-stress).
+        """
+        if self.n_bonds == 0 or self.fiber_l0 is None:
+            return
+        l0_np = self.fiber_l0.numpy()
+        l0_new = (l0_np / stretch).astype(np.float32)
+        with wp.ScopedDevice(self.device):
+            self.fiber_l0 = wp.array(l0_new, dtype=float)
+        print(f"MPMSimulator: fiber pre-stress — rest lengths scaled by "
+              f"1/{stretch:.3f}, tension strain {stretch - 1:.1%}")
 
     def get_positions(self) -> np.ndarray:
         """Return current particle positions as (n_particles, 3) float32 [m]."""
