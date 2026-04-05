@@ -599,8 +599,20 @@ class MPMCTHead:
             near = np.abs(p_sdf) < color_band
             pos_side = (p_sdf > 0) & near & self._is_tissue
             neg_side = (p_sdf < 0) & near & self._is_tissue
-            colors[pos_side] = [220, 80, 80]      # red side
-            colors[neg_side] = [80, 120, 220]     # blue side
+
+            # Checkerboard based on initial positions so deformation
+            # is visible as distortion of the checker pattern
+            x0 = self.sim.x0.numpy()
+            checker_size = 2.0 * self.sim.dx  # ~8mm squares
+            ci = (x0[:, 0] / checker_size).astype(int) % 2
+            cj = (x0[:, 1] / checker_size).astype(int) % 2
+            ck = (x0[:, 2] / checker_size).astype(int) % 2
+            checker = (ci ^ cj ^ ck).astype(bool)
+
+            colors[pos_side &  checker] = [220, 80, 80]   # red dark
+            colors[pos_side & ~checker] = [255, 160, 140]  # red light
+            colors[neg_side &  checker] = [80, 120, 220]   # blue dark
+            colors[neg_side & ~checker] = [140, 180, 255]  # blue light
 
         return colors
 
