@@ -160,11 +160,10 @@ def build_scalpel_sdf(sim, curve_points_ras_mm, depth_mm=20.0,
         d_normal = delta @ local_normal            # signed side distance
         d_depth  = delta @ local_depth             # >0 = outward, <0 = into tissue
 
-        # Limit the SDF to the actual cut ribbon region.  The band must
-        # be thick enough (±5 cells) that no quadratic B-spline stencil
-        # (3 cells wide) can bridge from one side to the other through
-        # neutral (zero-SDF) nodes.
-        stencil_margin = 5.0 * dx
+        # Limit the SDF to the actual cut ribbon region.  The margin
+        # must cover the B-spline stencil radius (1.5 cells) so no
+        # stencil can bridge across the cut through neutral nodes.
+        stencil_margin = 2.0 * dx
         in_depth = (d_depth > -depth_m - stencil_margin) & (d_depth < stencil_margin)
 
         d_along = v @ seg_dir
