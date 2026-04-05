@@ -158,17 +158,25 @@ def build_scalpel_sdf(sim, curve_points_ras_mm, depth_mm=20.0,
         delta = grid_pos - proj                    # (ng^3, 3)
 
         d_normal = delta @ local_normal            # signed side distance
+        d_depth  = delta @ local_depth             # >0 = outward, <0 = into tissue
 
-        # Every grid node gets a side assignment — the cut plane divides
-        # the entire grid into two half-spaces.  Any zero-SDF node acts
-        # as a coupling bridge that lets momentum transfer across the
-        # cut, defeating the separation.  The CRESSim-MPM approach
-        # requires ALL nodes to have a sign.
+        # Limit the SDF to the actual cut ribbon region.  The band must
+        # be thick enough (±5 cells) that no quadratic B-spline stencil
+        # (3 cells wide) can bridge from one side to the other through
+        # neutral (zero-SDF) nodes.
+        stencil_margin = 5.0 * dx
+        in_depth = (d_depth > -depth_m - stencil_margin) & (d_depth < stencil_margin)
+
+        d_along = v @ seg_dir
+        near_segment = ((d_along > -stencil_margin) &
+                        (d_along < seg_len + stencil_margin))
+
+        active = in_depth & near_segment
         candidate_sdf = d_normal
 
         # Keep the value closest to the cut surface per node
-        unassigned = sdf == 0.0
-        closer = (sdf != 0.0) & (np.abs(candidate_sdf) < np.abs(sdf))
+        unassigned = active & (sdf == 0.0)
+        closer = active & (sdf != 0.0) & (np.abs(candidate_sdf) < np.abs(sdf))
         sdf[unassigned | closer] = candidate_sdf[unassigned | closer]
 
     n_pos = int((sdf > 0).sum())
