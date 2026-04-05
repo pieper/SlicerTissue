@@ -1370,8 +1370,9 @@ class MPMSimulator:
     # Cutting
     # ------------------------------------------------------------------
 
-    def apply_cut(self, cut_sdf_np: np.ndarray):
-        """Register a cut surface defined by a signed distance field.
+    def apply_cut(self, cut_sdf_np: np.ndarray,
+                  retract_mm: float = 5.0, retract_steps: int = 100):
+        """Register a cut surface and retract the edges apart.
 
         The SDF is sampled on the MPM grid (n_grid^3 flat array, float32).
         The sign encodes which side of the cut a point is on.  During P2G
@@ -1379,14 +1380,19 @@ class MPMSimulator:
         sides are blocked, creating a velocity discontinuity that lets
         the tissue separate.  Fiber bonds crossing the cut are broken.
 
+        After applying the cut, particles near the cut surface are
+        displaced apart (like surgical retractors) over retract_steps
+        simulation steps.  This opens the wound visibly.
+
         Based on the CDF approach from:
           Ou & Tavakoli, "CRESSim-MPM: A Material Point Method Library for
           Surgical Soft Body Simulation with Cutting and Suturing",
           arXiv:2502.18437v3, 2025.
 
         Args:
-            cut_sdf_np:  (n_grid^3,) float32 array — signed distance on the
-                         MPM grid.  Positive on one side, negative on the other.
+            cut_sdf_np:   (n_grid^3,) float32 SDF on the MPM grid.
+            retract_mm:   How far to retract each side [mm]. 0 = no retraction.
+            retract_steps: Number of sim steps over which to apply retraction.
         """
         with wp.ScopedDevice(self.device):
             cut_sdf = wp.array(cut_sdf_np.astype(np.float32), dtype=float)
@@ -1432,6 +1438,47 @@ class MPMSimulator:
                 self.x0 = wp.array(x0_np, dtype=wp.vec3)
             print(f"MPMSimulator: reset F→I and x0→x for {n_reset} "
                   f"particles near cut (within {3*self.dx*1000:.0f} mm)")
+
+        # --- Retraction: displace near-cut particles apart ----------------
+        if retract_mm > 0 and retract_steps > 0:
+            retract_band = 2.0 * float(self.dx)
+            retract_pos = (p_sdf > 0) & (p_sdf < retract_band) & (fixed == 0)
+            retract_neg = (p_sdf < 0) & (p_sdf > -retract_band) & (fixed == 0)
+
+            # Compute the cut normal from the SDF gradient at the cut
+            # surface (direction of maximum SDF change).  Use the average
+            # gradient of near-cut positive particles.
+            sdf_at_pos = p_sdf[retract_pos]
+            pos_pts = pos[retract_pos]
+            if len(pos_pts) > 1:
+                # Approximate cut normal from SDF gradient via finite
+                # differences: direction from neg centroid to pos centroid
+                pos_centroid = pos[retract_pos].mean(axis=0)
+                neg_centroid = pos[retract_neg].mean(axis=0)
+                cut_dir = pos_centroid - neg_centroid
+                cut_dir_norm = float(np.linalg.norm(cut_dir))
+                if cut_dir_norm > 1e-8:
+                    cut_dir = cut_dir / cut_dir_norm
+                else:
+                    cut_dir = np.array([0.0, 0.0, 1.0])
+            else:
+                cut_dir = np.array([0.0, 0.0, 1.0])
+
+            step_disp = (retract_mm / 1000.0) / retract_steps
+            gravity_zero = np.array([0.0, 0.0, 0.0])
+
+            n_pos_r = int(retract_pos.sum())
+            n_neg_r = int(retract_neg.sum())
+            for _ in range(retract_steps):
+                x_np = self.x.numpy()
+                x_np[retract_pos] += step_disp * cut_dir
+                x_np[retract_neg] -= step_disp * cut_dir
+                with wp.ScopedDevice(self.device):
+                    self.x = wp.array(x_np, dtype=wp.vec3)
+                self.step(gravity_zero)
+
+            print(f"MPMSimulator: retracted {n_pos_r}+{n_neg_r} particles "
+                  f"by ±{retract_mm:.1f} mm over {retract_steps} steps")
 
     def set_prestress(self, stretch: float = 1.02):
         """Initialize F with isotropic stretch to create tissue pre-tension.
