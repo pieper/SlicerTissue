@@ -24,6 +24,101 @@ if _SRC_DIR not in sys.path:
 import warp as wp
 from newton_tissue.mpm import MPMMaterial, MPMSimulator
 
+
+# ---------------------------------------------------------------------------
+# GPU kernel for deformed CT resampling
+# ---------------------------------------------------------------------------
+
+@wp.func
+def _trilinear_sample_f(data: wp.array(dtype=float),
+                         nx: int, ny: int, nz: int,
+                         fx: float, fy: float, fz: float) -> float:
+    """Trilinear interpolation of a flat 3-D float array (IJK layout)."""
+    ix = int(wp.floor(fx));  iy = int(wp.floor(fy));  iz = int(wp.floor(fz))
+    dx = fx - float(ix);     dy = fy - float(iy);     dz = fz - float(iz)
+    ix = wp.clamp(ix, 0, nx - 2);  iy = wp.clamp(iy, 0, ny - 2)
+    iz = wp.clamp(iz, 0, nz - 2)
+    i000 = ix * ny * nz + iy * nz + iz
+    i001 = i000 + 1;           i010 = i000 + nz
+    i011 = i010 + 1;           i100 = i000 + ny * nz
+    i101 = i100 + 1;           i110 = i100 + nz;   i111 = i110 + 1
+    c00 = data[i000] * (1.0 - dz) + data[i001] * dz
+    c01 = data[i010] * (1.0 - dz) + data[i011] * dz
+    c10 = data[i100] * (1.0 - dz) + data[i101] * dz
+    c11 = data[i110] * (1.0 - dz) + data[i111] * dz
+    c0 = c00 * (1.0 - dy) + c01 * dy
+    c1 = c10 * (1.0 - dy) + c11 * dy
+    return c0 * (1.0 - dx) + c1 * dx
+
+
+@wp.kernel
+def _resample_deformed_ct(
+    # displacement grid (ng^3 flat, 3 separate arrays) [metres]
+    disp_x: wp.array(dtype=float),
+    disp_y: wp.array(dtype=float),
+    disp_z: wp.array(dtype=float),
+    mass:   wp.array(dtype=float),
+    cut_sdf: wp.array(dtype=float),
+    ng: int,
+    # CT data (flat float array in IJK order)
+    ct_data: wp.array(dtype=float),
+    ct_ni: int, ct_nj: int, ct_nk: int,
+    # RAS-to-CT-IJK matrix (row-major 4×4 stored as 16 floats)
+    m00: float, m01: float, m02: float, m03: float,
+    m10: float, m11: float, m12: float, m13: float,
+    m20: float, m21: float, m22: float, m23: float,
+    # output grid params
+    out_ni: int, out_nj: int, out_nk: int,
+    out_dx_mm: float,
+    out_ox: float, out_oy: float, out_oz: float,  # origin RAS mm
+    mpm_dx_mm: float,
+    mpm_ox: float, mpm_oy: float, mpm_oz: float,  # MPM grid origin
+    # output
+    output: wp.array(dtype=float),
+):
+    tid = wp.tid()
+    # output IJK
+    oi = tid % out_ni
+    oj = (tid // out_ni) % out_nj
+    ok = tid // (out_ni * out_nj)
+
+    # output voxel RAS (mm)
+    rx = float(oi) * out_dx_mm + out_ox
+    ry = float(oj) * out_dx_mm + out_oy
+    rz = float(ok) * out_dx_mm + out_oz
+
+    # MPM grid float coords
+    mx = (rx - mpm_ox) / mpm_dx_mm
+    my = (ry - mpm_oy) / mpm_dx_mm
+    mz = (rz - mpm_oz) / mpm_dx_mm
+
+    # trilinear sample displacement (metres)
+    ddx = _trilinear_sample_f(disp_x, ng, ng, ng, mx, my, mz)
+    ddy = _trilinear_sample_f(disp_y, ng, ng, ng, mx, my, mz)
+    ddz = _trilinear_sample_f(disp_z, ng, ng, ng, mx, my, mz)
+
+    # source RAS = output RAS − displacement (convert m → mm)
+    sx = rx - ddx * 1000.0
+    sy = ry - ddy * 1000.0
+    sz = rz - ddz * 1000.0
+
+    # source RAS → CT IJK
+    ci = m00 * sx + m01 * sy + m02 * sz + m03
+    cj = m10 * sx + m11 * sy + m12 * sz + m13
+    ck = m20 * sx + m21 * sy + m22 * sz + m23
+
+    # sample original CT (trilinear)
+    hu = _trilinear_sample_f(ct_data, ct_ni, ct_nj, ct_nk, ci, cj, ck)
+
+    # wound mask: near cut, no mass → air
+    m_val = _trilinear_sample_f(mass, ng, ng, ng, mx, my, mz)
+    s_val = _trilinear_sample_f(cut_sdf, ng, ng, ng, mx, my, mz)
+    if m_val < 1.0e-10 and wp.abs(s_val) > 0.0 and hu > -500.0:
+        hu = -1000.0
+
+    output[tid] = hu
+
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -611,16 +706,44 @@ class MPMCTHead:
         # Pre-compute MPM grid float indices for each output voxel
         self._out_mpm_ijk = ((self._out_ras - offset) / 1000.0 / dx_m)
 
+        # --- Upload CT to GPU (once) --------------------------------------
+        # Store as float32 in IJK order for the warp kernel
+        ct_ijk = self._ct_arr.transpose(2, 1, 0).astype(np.float32).ravel()
+        with wp.ScopedDevice(self.device):
+            self._ct_gpu = wp.array(ct_ijk, dtype=float)
+
+        # Output volume at a practical resolution (2× MPM grid = ~2mm)
+        out_dx_mm = dx_mm / 2.0
+        out_n = int(np.ceil(ng * dx_mm / out_dx_mm))
+        self._out_n = out_n
+        self._out_dx_mm = out_dx_mm
+        with wp.ScopedDevice(self.device):
+            self._out_gpu = wp.zeros(out_n ** 3, dtype=float)
+
+        ijk2ras_out = vtk.vtkMatrix4x4()
+        ijk2ras_out.Identity()
+        ijk2ras_out.SetElement(0, 0, out_dx_mm)
+        ijk2ras_out.SetElement(1, 1, out_dx_mm)
+        ijk2ras_out.SetElement(2, 2, out_dx_mm)
+        ijk2ras_out.SetElement(0, 3, offset[0])
+        ijk2ras_out.SetElement(1, 3, offset[1])
+        ijk2ras_out.SetElement(2, 3, offset[2])
+        self._out_ijk2ras = ijk2ras_out
+
         # --- Create the DeformedCT volume --------------------------------
         old = slicer.mrmlScene.GetFirstNodeByName('DeformedCT')
         if old:
             slicer.mrmlScene.RemoveNode(old)
 
+        empty = np.full((out_n, out_n, out_n), -1000, dtype=np.int16)
         self._deformed_ct = slicer.util.addVolumeFromArray(
-            self._ct_arr.copy(), ijkToRAS=ijk2ras, name='DeformedCT')
+            empty, ijkToRAS=ijk2ras_out, name='DeformedCT')
 
         # Initial resample
         self.update_deformed_ct()
+
+        print(f"MPMCTHead: CT uploaded to GPU ({len(ct_ijk)/1e6:.1f}M voxels), "
+              f"output grid {out_n}^3 at {out_dx_mm:.1f}mm")
 
         # --- Volume rendering with soft-tissue TF ------------------------
         vrLogic = slicer.modules.volumerendering.logic()
@@ -658,81 +781,78 @@ class MPMCTHead:
         print("MPMCTHead: deformed CT visualization ready")
 
     def update_deformed_ct(self):
-        """Resample CT through current displacement field with wound mask.
+        """Resample CT on GPU through current displacement field + wound mask.
 
         Called periodically (controlled by _ct_update_interval).
-        For each output voxel at full CT resolution:
-          1. Sample displacement from MPM grid (trilinear)
-          2. Backward-warp: sample original CT at (output_pos - disp)
-          3. Wound mask: where mass_grid=0 near cut → air HU
+        The warp kernel _resample_deformed_ct handles trilinear sampling
+        of both the displacement grid and the CT volume on the GPU.
         """
-        if self._deformed_ct is None:
+        if self._deformed_ct is None or self._ct_gpu is None:
             return
         import slicer
-        from scipy.ndimage import map_coordinates
 
         pos    = self.sim.get_positions()
         x0     = self.sim.x0.numpy()
-        disp   = pos - x0              # [m]
+        disp   = pos - x0
         mass_p = self.sim.m_p.numpy()
         ng     = self.sim.n_grid
         inv_dx = self.sim.inv_dx
 
-        # --- Scatter displacement and mass to MPM grid -------------------
-        disp_grid = np.zeros((ng, ng, ng, 3), dtype=np.float64)
-        mass_grid = np.zeros((ng, ng, ng), dtype=np.float64)
-
+        # Scatter displacement and mass to MPM grid (CPU — small grid)
+        disp_grid = np.zeros((ng, ng, ng, 3), dtype=np.float32)
+        mass_grid = np.zeros((ng, ng, ng), dtype=np.float32)
         gi = np.clip(np.round(pos[:, 0] * inv_dx).astype(int), 0, ng - 1)
         gj = np.clip(np.round(pos[:, 1] * inv_dx).astype(int), 0, ng - 1)
         gk = np.clip(np.round(pos[:, 2] * inv_dx).astype(int), 0, ng - 1)
-
         np.add.at(mass_grid, (gi, gj, gk), mass_p)
         for d in range(3):
             np.add.at(disp_grid[:, :, :, d], (gi, gj, gk),
                        mass_p * disp[:, d])
-
         valid = mass_grid > 0
         for d in range(3):
             disp_grid[:, :, :, d][valid] /= mass_grid[valid]
 
-        # --- Sample displacement at each CT voxel (trilinear) ------------
-        coords = np.stack([self._out_mpm_ijk[:, 0],
-                           self._out_mpm_ijk[:, 1],
-                           self._out_mpm_ijk[:, 2]])
-        disp_at_ct = np.zeros((len(self._out_ras), 3), dtype=np.float64)
-        for d in range(3):
-            disp_at_ct[:, d] = map_coordinates(
-                disp_grid[:, :, :, d], coords, order=1, mode='nearest')
+        # Upload displacement grid to GPU
+        dx_flat = disp_grid[:, :, :, 0].ravel().astype(np.float32)
+        dy_flat = disp_grid[:, :, :, 1].ravel().astype(np.float32)
+        dz_flat = disp_grid[:, :, :, 2].ravel().astype(np.float32)
+        m_flat  = mass_grid.ravel().astype(np.float32)
 
-        # --- Backward warp: source_ras = output_ras - displacement -------
-        source_ras = self._out_ras - disp_at_ct * 1000.0
+        with wp.ScopedDevice(self.device):
+            disp_x_gpu = wp.array(dx_flat, dtype=float)
+            disp_y_gpu = wp.array(dy_flat, dtype=float)
+            disp_z_gpu = wp.array(dz_flat, dtype=float)
+            mass_gpu   = wp.array(m_flat, dtype=float)
 
-        source_homo = np.column_stack(
-            [source_ras, np.ones(len(source_ras))])
-        source_ijk = (self._ct_ras2ijk @ source_homo.T).T[:, :3]
+            cut_sdf_gpu = (self.sim.cut_sdfs[-1]
+                           if self.sim.cut_sdfs
+                           else wp.zeros(ng ** 3, dtype=float))
 
-        ct_coords = np.stack(
-            [source_ijk[:, 2], source_ijk[:, 1], source_ijk[:, 0]])
-        sampled = map_coordinates(self._ct_arr, ct_coords, order=1,
-                                   mode='constant', cval=-1000)
+            # RAS→IJK matrix elements
+            M = self._ct_ras2ijk
+            nK, nJ, nI = self._ct_arr.shape
+            offset = self._ras_offset_mm
+            dx_mm = self.sim.dx * 1000.0
+            on = self._out_n
 
-        # --- Wound mask: no mass near cut → air --------------------------
-        if self.sim.cut_sdfs:
-            cut_sdf_flat = self.sim.cut_sdfs[-1].numpy()
-            # Sample mass and SDF at CT voxel positions on the MPM grid
-            mass_at_ct = map_coordinates(
-                mass_grid, coords, order=1, mode='constant', cval=0)
-            sdf_at_ct = map_coordinates(
-                cut_sdf_flat.reshape(ng, ng, ng), coords,
-                order=1, mode='constant', cval=0)
-            cavity = ((np.abs(sdf_at_ct) > 0) &
-                      (mass_at_ct < 1e-10) &
-                      (sampled > -500))
-            sampled[cavity] = -1000
+            wp.launch(_resample_deformed_ct, dim=on ** 3, inputs=[
+                disp_x_gpu, disp_y_gpu, disp_z_gpu, mass_gpu, cut_sdf_gpu,
+                ng,
+                self._ct_gpu, nI, nJ, nK,
+                float(M[0, 0]), float(M[0, 1]), float(M[0, 2]), float(M[0, 3]),
+                float(M[1, 0]), float(M[1, 1]), float(M[1, 2]), float(M[1, 3]),
+                float(M[2, 0]), float(M[2, 1]), float(M[2, 2]), float(M[2, 3]),
+                on, on, on,
+                float(self._out_dx_mm),
+                float(offset[0]), float(offset[1]), float(offset[2]),
+                float(dx_mm),
+                float(offset[0]), float(offset[1]), float(offset[2]),
+                self._out_gpu,
+            ])
 
-        # --- Update the Slicer volume (KJI order) ------------------------
-        nK, nJ, nI = self._ct_arr.shape
-        out_kji = sampled.reshape(nI, nJ, nK).transpose(2, 1, 0).astype(np.int16)
+        # Download and update Slicer volume
+        result = self._out_gpu.numpy().reshape(on, on, on)
+        out_kji = result.transpose(2, 1, 0).astype(np.int16)
 
         arr = slicer.util.arrayFromVolume(self._deformed_ct)
         arr[:] = out_kji
