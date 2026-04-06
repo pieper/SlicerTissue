@@ -583,6 +583,8 @@ class MPMCTHead:
 
     def stop_simulation_loop(self):
         self._loop_running = False
+        if hasattr(self, '_start_stop_btn') and self._start_stop_btn:
+            self._start_stop_btn.text = "Start"
         for node, tag in self._observer_tags:
             try:
                 node.RemoveObserver(tag)
@@ -992,12 +994,30 @@ class MPMCTHead:
         self._grav_label = qt.QLabel(" 1.00 g")
         self._toolbar.addWidget(self._grav_label)
 
+        self._toolbar.addSeparator()
+
+        self._start_stop_btn = qt.QPushButton("Stop")
+        self._start_stop_btn.setFixedWidth(60)
+        self._start_stop_btn.setToolTip("Start / stop the simulation loop")
+        self._start_stop_btn.clicked.connect(self._on_start_stop)
+        self._toolbar.addWidget(self._start_stop_btn)
+
+    def _on_start_stop(self):
+        if self._loop_running:
+            self.stop_simulation_loop()
+            self._start_stop_btn.text = "Start"
+        else:
+            self.start_simulation_loop()
+            self._start_stop_btn.text = "Stop"
+
     def _on_gravity_changed(self, value):
         self._gravity_scale = value / 100.0
         self._grav_label.text = f" {self._gravity_scale:+.2f} g"
         self._idle_ticks = 0
         if not self._loop_running:
             self.start_simulation_loop()
+            if hasattr(self, '_start_stop_btn'):
+                self._start_stop_btn.text = "Stop"
 
     def cleanup_toolbar(self):
         """Remove the gravity toolbar."""
