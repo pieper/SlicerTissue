@@ -285,8 +285,10 @@ class CurveObserver:
             # Create a model of the cut ribbon geometry
             self._create_cut_model(ribbon_quads_ras, curve_node.GetName())
 
-            # Update particle colors to show cut sides
-            if hasattr(self.mpm_wrapper, 'rebuild_colors'):
+            # Set up deformed CT volume rendering (replaces point model)
+            if hasattr(self.mpm_wrapper, 'setup_deformed_ct'):
+                self.mpm_wrapper.setup_deformed_ct()
+            elif hasattr(self.mpm_wrapper, 'rebuild_colors'):
                 self.mpm_wrapper.rebuild_colors()
 
             # Restart the simulation loop if it was idle
