@@ -257,6 +257,7 @@ class MPMCTHead:
         self._slider        = None
         self._toolbar       = None
         self._deformed_ct        = None
+        self._vr_display_node    = None
         self._last_ct_update     = 0.0
         self._ct_update_interval = 0.2   # seconds between CT resamples
 
@@ -635,13 +636,26 @@ class MPMCTHead:
                 self.sim.step(g)
 
         pos_now = self.sim.get_positions()
-        if self._deformed_ct is not None:
+        vr_visible = (self._vr_display_node is not None
+                      and self._vr_display_node.GetVisibility())
+        if vr_visible:
             import time
             now = time.time()
             if now - self._last_ct_update > self._ct_update_interval:
                 self.update_deformed_ct()
                 self._last_ct_update = now
+            # Hide point model while VR is active
+            if self.vtk_model:
+                dn = self.vtk_model.GetDisplayNode()
+                if dn and dn.GetVisibility():
+                    dn.SetVisibility(False)
         else:
+            # Show and update point model when VR is hidden
+            if self.vtk_model:
+                dn = self.vtk_model.GetDisplayNode()
+                if dn and not dn.GetVisibility():
+                    dn.SetVisibility(True)
+                    self.rebuild_colors()
             self.update_model()
 
         if self._prev_tick_pos is not None:
@@ -745,6 +759,7 @@ class MPMCTHead:
         vrdn = vrLogic.CreateDefaultVolumeRenderingNodes(self._deformed_ct)
         vrdn = vrLogic.GetFirstVolumeRenderingDisplayNode(self._deformed_ct)
         vrdn.SetVisibility(True)
+        self._vr_display_node = vrdn
 
         vp = vrdn.GetVolumePropertyNode().GetVolumeProperty()
         otf = vp.GetScalarOpacity()
