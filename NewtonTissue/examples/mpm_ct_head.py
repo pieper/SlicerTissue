@@ -149,8 +149,9 @@ class MPMCTHead:
         self._contact_sphere = None
         self._slider        = None
         self._toolbar       = None
-        self._grid_transform = None
-        self._deformed_ct    = None
+        self._deformed_ct        = None
+        self._last_ct_update     = 0.0
+        self._ct_update_interval = 0.2   # seconds between CT resamples
 
     # ------------------------------------------------------------------
     # Particle setup
@@ -523,7 +524,11 @@ class MPMCTHead:
 
         pos_now = self.sim.get_positions()
         if self._deformed_ct is not None:
-            self.update_displacement_field()
+            import time
+            now = time.time()
+            if now - self._last_ct_update > self._ct_update_interval:
+                self.update_deformed_ct()
+                self._last_ct_update = now
         else:
             self.update_model()
 
@@ -560,18 +565,17 @@ class MPMCTHead:
             self.vtk_model.GetPolyData().Modified()
 
     def setup_deformed_ct(self):
-        """Create a deformed CT volume rendered through a grid transform.
+        """Create a resampled deformed CT with wound cavity visualization.
 
         Called once after a cut is applied.  Creates:
-          - A copy of the CT volume with the cut surface masked to air
-          - A grid transform node driven by particle displacements
+          - An output volume at MPM grid resolution (~4 mm)
           - Volume rendering with a soft-tissue transfer function
+          - Pre-computed coordinate mapping for fast per-tick updates
 
-        Subsequent calls to update_displacement_field() update the
-        transform each tick so the deformed CT tracks the simulation.
+        Subsequent calls to update_deformed_ct() resample the CT
+        through the current displacement field ~5-10× per second.
         """
         import slicer, vtk
-        from vtk.util.numpy_support import numpy_to_vtk
         from scipy.ndimage import map_coordinates
 
         ng     = self.sim.n_grid
@@ -580,67 +584,43 @@ class MPMCTHead:
         inv_dx = self.sim.inv_dx
         offset = self._ras_offset_mm
 
-        # --- Masked CT: thin strip along cut surface → air ---------------
-        ct_arr = self._volume_array(self.volume_node)  # (K,J,I)
-        nK, nJ, nI = ct_arr.shape
+        # --- Pre-compute output grid → CT source mapping -----------------
+        # Output volume matches the original CT geometry (full resolution)
+        self._ct_arr = self._volume_array(self.volume_node)  # (K,J,I)
+        nK, nJ, nI = self._ct_arr.shape
 
         ijk2ras = vtk.vtkMatrix4x4()
         self.volume_node.GetIJKToRASMatrix(ijk2ras)
+        self._out_ijk2ras = vtk.vtkMatrix4x4()
+        self._out_ijk2ras.DeepCopy(ijk2ras)
+
+        ras2ijk = vtk.vtkMatrix4x4()
+        self.volume_node.GetRASToIJKMatrix(ras2ijk)
+        self._ct_ras2ijk = np.array(
+            [[ras2ijk.GetElement(r, c) for c in range(4)] for r in range(4)])
+
+        # RAS positions for every CT voxel (pre-computed once)
         M = np.array([[ijk2ras.GetElement(r, c) for c in range(4)]
                        for r in range(4)])
+        ii, jj, kk = np.meshgrid(
+            np.arange(nI), np.arange(nJ), np.arange(nK), indexing='ij')
+        ijk_homo = np.stack([ii.ravel(), jj.ravel(), kk.ravel(),
+                             np.ones(nI * nJ * nK)], axis=1)
+        self._out_ras = (M @ ijk_homo.T).T[:, :3]  # (N, 3)
 
-        # Sample cut SDF at each CT voxel
-        if self.sim.cut_sdfs:
-            sdf_3d = self.sim.cut_sdfs[-1].numpy().reshape(ng, ng, ng)
-            ii, jj, kk = np.meshgrid(
-                np.arange(nI), np.arange(nJ), np.arange(nK), indexing='ij')
-            ijk_homo = np.stack([ii.ravel(), jj.ravel(), kk.ravel(),
-                                 np.ones(nI * nJ * nK)], axis=1)
-            ras = (M @ ijk_homo.T).T[:, :3]
-            mpm_ijk = (ras - offset) / 1000.0 / dx_m
-            coords = np.stack([mpm_ijk[:, 0], mpm_ijk[:, 1], mpm_ijk[:, 2]])
-            sdf_at_ct = map_coordinates(sdf_3d, coords, order=1,
-                                        mode='constant', cval=0)
-            sdf_vol = sdf_at_ct.reshape(nI, nJ, nK).transpose(2, 1, 0)
+        # Pre-compute MPM grid float indices for each output voxel
+        self._out_mpm_ijk = ((self._out_ras - offset) / 1000.0 / dx_m)
 
-            # Mask: thin strip (±1 voxel) along cut → air
-            ct_spacing = np.array(self.volume_node.GetSpacing())
-            strip_width = float(ct_spacing.max()) * 1.5 / 1000.0  # in sim m
-            cut_strip = (np.abs(sdf_vol) < strip_width) & (sdf_vol != 0)
-            masked_arr = ct_arr.copy()
-            masked_arr[cut_strip & (ct_arr > -500)] = -1000
-            print(f"MPMCTHead: cut strip masked {int(cut_strip.sum())} voxels")
-        else:
-            masked_arr = ct_arr.copy()
-
-        # --- Create / update the DeformedCT volume -----------------------
+        # --- Create the DeformedCT volume --------------------------------
         old = slicer.mrmlScene.GetFirstNodeByName('DeformedCT')
         if old:
             slicer.mrmlScene.RemoveNode(old)
 
         self._deformed_ct = slicer.util.addVolumeFromArray(
-            masked_arr.astype(np.int16), ijkToRAS=ijk2ras, name='DeformedCT')
+            self._ct_arr.copy(), ijkToRAS=ijk2ras, name='DeformedCT')
 
-        # --- Create / update the grid transform --------------------------
-        old_tf = slicer.mrmlScene.GetFirstNodeByName('MPMDisplacement')
-        if old_tf:
-            slicer.mrmlScene.RemoveNode(old_tf)
-
-        self._grid_transform = slicer.mrmlScene.AddNewNodeByClass(
-            'vtkMRMLGridTransformNode', 'MPMDisplacement')
-        ogt = self._grid_transform.GetTransformFromParent()
-        grid = ogt.GetDisplacementGrid()
-        grid.SetDimensions(ng, ng, ng)
-        grid.SetSpacing(dx_mm, dx_mm, dx_mm)
-        grid.SetOrigin(float(offset[0]), float(offset[1]), float(offset[2]))
-        grid.AllocateScalars(vtk.VTK_DOUBLE, 3)
-
-        # Initial displacement
-        self.update_displacement_field()
-
-        # Put DeformedCT under the transform
-        self._deformed_ct.SetAndObserveTransformNodeID(
-            self._grid_transform.GetID())
+        # Initial resample
+        self.update_deformed_ct()
 
         # --- Volume rendering with soft-tissue TF ------------------------
         vrLogic = slicer.modules.volumerendering.logic()
@@ -674,33 +654,31 @@ class MPMCTHead:
         if self.vtk_model:
             self.vtk_model.GetDisplayNode().SetVisibility(False)
 
-        # Show in slice views too
         slicer.util.setSliceViewerLayers(background=self._deformed_ct)
         print("MPMCTHead: deformed CT visualization ready")
 
-    def update_displacement_field(self):
-        """Update the grid transform and wound mask from current state.
+    def update_deformed_ct(self):
+        """Resample CT through current displacement field with wound mask.
 
-        Called each simulation tick to keep the deformed CT in sync
-        with the particle positions.  Also recomputes the wound cavity
-        mask so the opening grows as the simulation progresses.
+        Called periodically (controlled by _ct_update_interval).
+        For each output voxel at full CT resolution:
+          1. Sample displacement from MPM grid (trilinear)
+          2. Backward-warp: sample original CT at (output_pos - disp)
+          3. Wound mask: where mass_grid=0 near cut → air HU
         """
-        if self._grid_transform is None:
+        if self._deformed_ct is None:
             return
-        import slicer, vtk
-        from vtk.util.numpy_support import numpy_to_vtk
-        from scipy.ndimage import map_coordinates, binary_dilation
+        import slicer
+        from scipy.ndimage import map_coordinates
 
         pos    = self.sim.get_positions()
         x0     = self.sim.x0.numpy()
-        disp   = pos - x0
+        disp   = pos - x0              # [m]
         mass_p = self.sim.m_p.numpy()
         ng     = self.sim.n_grid
-        dx_m   = self.sim.dx
         inv_dx = self.sim.inv_dx
-        offset = self._ras_offset_mm
 
-        # --- Update grid transform displacements -------------------------
+        # --- Scatter displacement and mass to MPM grid -------------------
         disp_grid = np.zeros((ng, ng, ng, 3), dtype=np.float64)
         mass_grid = np.zeros((ng, ng, ng), dtype=np.float64)
 
@@ -717,75 +695,47 @@ class MPMCTHead:
         for d in range(3):
             disp_grid[:, :, :, d][valid] /= mass_grid[valid]
 
-        disp_mm = (disp_grid * 1000.0).transpose(2, 1, 0, 3)
-        flat = disp_mm.reshape(-1, 3).copy()
+        # --- Sample displacement at each CT voxel (trilinear) ------------
+        coords = np.stack([self._out_mpm_ijk[:, 0],
+                           self._out_mpm_ijk[:, 1],
+                           self._out_mpm_ijk[:, 2]])
+        disp_at_ct = np.zeros((len(self._out_ras), 3), dtype=np.float64)
+        for d in range(3):
+            disp_at_ct[:, d] = map_coordinates(
+                disp_grid[:, :, :, d], coords, order=1, mode='nearest')
 
-        ogt = self._grid_transform.GetTransformFromParent()
-        grid_data = ogt.GetDisplacementGrid()
-        vtk_arr = numpy_to_vtk(flat, deep=True, array_type=vtk.VTK_DOUBLE)
-        vtk_arr.SetNumberOfComponents(3)
-        grid_data.GetPointData().SetScalars(vtk_arr)
-        grid_data.Modified()
-        self._grid_transform.Modified()
+        # --- Backward warp: source_ras = output_ras - displacement -------
+        source_ras = self._out_ras - disp_at_ct * 1000.0
 
-        # --- Recompute wound mask from current particle positions ---------
-        if self._deformed_ct is None or not self.sim.cut_sdfs:
-            return
+        source_homo = np.column_stack(
+            [source_ras, np.ones(len(source_ras))])
+        source_ijk = (self._ct_ras2ijk @ source_homo.T).T[:, :3]
 
-        ct_arr = self._volume_array(self.volume_node)
-        nK, nJ, nI = ct_arr.shape
-        ijk2ras = vtk.vtkMatrix4x4()
-        self.volume_node.GetIJKToRASMatrix(ijk2ras)
-        ras2ijk = vtk.vtkMatrix4x4()
-        self.volume_node.GetRASToIJKMatrix(ras2ijk)
-        M_inv = np.array([[ras2ijk.GetElement(r, c) for c in range(4)]
-                           for r in range(4)])
+        ct_coords = np.stack(
+            [source_ijk[:, 2], source_ijk[:, 1], source_ijk[:, 0]])
+        sampled = map_coordinates(self._ct_arr, ct_coords, order=1,
+                                   mode='constant', cval=-1000)
 
-        # Mark voxels that currently have particles nearby
-        pos_ras = pos * 1000.0 + offset
-        pos_homo = np.column_stack([pos_ras, np.ones(len(pos_ras))])
-        pos_ijk = (M_inv @ pos_homo.T).T[:, :3]
-        has_particles = np.zeros((nK, nJ, nI), dtype=bool)
-        ci = np.clip(np.round(pos_ijk[:, 0]).astype(int), 0, nI - 1)
-        cj = np.clip(np.round(pos_ijk[:, 1]).astype(int), 0, nJ - 1)
-        ck = np.clip(np.round(pos_ijk[:, 2]).astype(int), 0, nK - 1)
-        has_particles[ck, cj, ci] = True
-        has_particles = binary_dilation(has_particles, iterations=2)
+        # --- Wound mask: no mass near cut → air --------------------------
+        if self.sim.cut_sdfs:
+            cut_sdf_flat = self.sim.cut_sdfs[-1].numpy()
+            # Sample mass and SDF at CT voxel positions on the MPM grid
+            mass_at_ct = map_coordinates(
+                mass_grid, coords, order=1, mode='constant', cval=0)
+            sdf_at_ct = map_coordinates(
+                cut_sdf_flat.reshape(ng, ng, ng), coords,
+                order=1, mode='constant', cval=0)
+            cavity = ((np.abs(sdf_at_ct) > 0) &
+                      (mass_at_ct < 1e-10) &
+                      (sampled > -500))
+            sampled[cavity] = -1000
 
-        # Seed: near cut plane, had tissue, no particles now
-        sdf_3d = self.sim.cut_sdfs[-1].numpy().reshape(ng, ng, ng)
-        M = np.array([[ijk2ras.GetElement(r, c) for c in range(4)]
-                       for r in range(4)])
-        ii, jj, kk = np.meshgrid(
-            np.arange(nI), np.arange(nJ), np.arange(nK), indexing='ij')
-        ijk_homo = np.stack([ii.ravel(), jj.ravel(), kk.ravel(),
-                             np.ones(nI * nJ * nK)], axis=1)
-        ras_all = (M @ ijk_homo.T).T[:, :3]
-        mpm_ijk = (ras_all - offset) / 1000.0 / dx_m
-        coords = np.stack([mpm_ijk[:, 0], mpm_ijk[:, 1], mpm_ijk[:, 2]])
-        sdf_vol = map_coordinates(sdf_3d, coords, order=1,
-                                   mode='constant', cval=0
-                                   ).reshape(nI, nJ, nK).transpose(2, 1, 0)
+        # --- Update the Slicer volume (KJI order) ------------------------
+        nK, nJ, nI = self._ct_arr.shape
+        out_kji = sampled.reshape(nI, nJ, nK).transpose(2, 1, 0).astype(np.int16)
 
-        had_tissue = (ct_arr > -200) & (ct_arr < 300)
-        seed = ((np.abs(sdf_vol) < 0.005) & (sdf_vol != 0) &
-                had_tissue & ~has_particles)
-
-        # Region grow
-        mask = seed.copy()
-        grow_target = had_tissue & ~has_particles
-        for _ in range(30):
-            expanded = binary_dilation(mask, iterations=1)
-            new = expanded & grow_target & ~mask
-            if new.sum() == 0:
-                break
-            mask |= new
-
-        # Apply mask to the deformed CT volume data
-        deformed_arr = slicer.util.arrayFromVolume(self._deformed_ct)
-        # Restore original CT values first, then mask cavity
-        deformed_arr[:] = ct_arr
-        deformed_arr[mask] = -1000
+        arr = slicer.util.arrayFromVolume(self._deformed_ct)
+        arr[:] = out_kji
         slicer.util.arrayFromVolumeModified(self._deformed_ct)
 
     def rebuild_colors(self):
