@@ -573,7 +573,10 @@ class MPMCTHead:
             return
         self._create_vtk_model()
         self._create_gravity_slider()
-        self.update_model()
+        # Show the deformed CT volume rendering from the start so the
+        # user can place curve points on the skin surface.  The point
+        # model is hidden; it can be re-enabled from the Data module.
+        self.setup_deformed_ct()
         self._setup_view()
         self.start_simulation_loop()
 
@@ -846,8 +849,10 @@ class MPMCTHead:
 
         # Download and update Slicer volume
         nI, nJ, nK = self._out_ni, self._out_nj, self._out_nk
-        result = self._out_gpu.numpy().reshape(nI, nJ, nK)
-        out_kji = result.transpose(2, 1, 0).astype(np.int16)
+        # Kernel output has I fastest (tid % nI), K slowest — reshape as
+        # (K,J,I) in C order so the last axis (I) is fastest, matching
+        # both the kernel layout and Slicer's KJI array convention.
+        out_kji = self._out_gpu.numpy().reshape(nK, nJ, nI).astype(np.int16)
 
         arr = slicer.util.arrayFromVolume(self._deformed_ct)
         arr[:] = out_kji
