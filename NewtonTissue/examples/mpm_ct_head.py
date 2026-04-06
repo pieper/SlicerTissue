@@ -63,54 +63,66 @@ def _resample_deformed_ct(
     # CT data (flat float array in IJK order)
     ct_data: wp.array(dtype=float),
     ct_ni: int, ct_nj: int, ct_nk: int,
-    # RAS-to-CT-IJK matrix (row-major 4×4 stored as 16 floats)
-    m00: float, m01: float, m02: float, m03: float,
-    m10: float, m11: float, m12: float, m13: float,
-    m20: float, m21: float, m22: float, m23: float,
-    # output grid params
+    # output IJKToRAS (row-major, maps output IJK → RAS mm)
+    a00: float, a01: float, a02: float, a03: float,
+    a10: float, a11: float, a12: float, a13: float,
+    a20: float, a21: float, a22: float, a23: float,
+    # RAS-to-CT-IJK (row-major, maps RAS mm → source CT IJK)
+    b00: float, b01: float, b02: float, b03: float,
+    b10: float, b11: float, b12: float, b13: float,
+    b20: float, b21: float, b22: float, b23: float,
+    # output dims
     out_ni: int, out_nj: int, out_nk: int,
-    out_dx_mm: float,
-    out_ox: float, out_oy: float, out_oz: float,  # origin RAS mm
+    # MPM grid origin (RAS mm) and spacing (mm)
+    mpm_ox: float, mpm_oy: float, mpm_oz: float,
     mpm_dx_mm: float,
-    mpm_ox: float, mpm_oy: float, mpm_oz: float,  # MPM grid origin
     # output
     output: wp.array(dtype=float),
 ):
     tid = wp.tid()
-    # output IJK
     oi = tid % out_ni
     oj = (tid // out_ni) % out_nj
     ok = tid // (out_ni * out_nj)
 
-    # output voxel RAS (mm)
-    rx = float(oi) * out_dx_mm + out_ox
-    ry = float(oj) * out_dx_mm + out_oy
-    rz = float(ok) * out_dx_mm + out_oz
+    fi = float(oi); fj = float(oj); fk = float(ok)
 
-    # MPM grid float coords
+    # output IJK → RAS mm (full matrix, handles rotation + spacing)
+    rx = a00 * fi + a01 * fj + a02 * fk + a03
+    ry = a10 * fi + a11 * fj + a12 * fk + a13
+    rz = a20 * fi + a21 * fj + a22 * fk + a23
+
+    # RAS mm → MPM grid float coords
     mx = (rx - mpm_ox) / mpm_dx_mm
     my = (ry - mpm_oy) / mpm_dx_mm
     mz = (rz - mpm_oz) / mpm_dx_mm
 
-    # trilinear sample displacement (metres)
+    # Check if inside the MPM grid; if outside, pass through original CT
+    if mx < 0.0 or mx > float(ng - 1) or my < 0.0 or my > float(ng - 1) or mz < 0.0 or mz > float(ng - 1):
+        # Outside MPM domain — sample original CT undeformed
+        ci = b00 * rx + b01 * ry + b02 * rz + b03
+        cj = b10 * rx + b11 * ry + b12 * rz + b13
+        ck = b20 * rx + b21 * ry + b22 * rz + b23
+        output[tid] = _trilinear_sample_f(ct_data, ct_ni, ct_nj, ct_nk, ci, cj, ck)
+        return
+
+    # Trilinear sample displacement (metres)
     ddx = _trilinear_sample_f(disp_x, ng, ng, ng, mx, my, mz)
     ddy = _trilinear_sample_f(disp_y, ng, ng, ng, mx, my, mz)
     ddz = _trilinear_sample_f(disp_z, ng, ng, ng, mx, my, mz)
 
-    # source RAS = output RAS − displacement (convert m → mm)
+    # Source RAS = output RAS − displacement (m → mm)
     sx = rx - ddx * 1000.0
     sy = ry - ddy * 1000.0
     sz = rz - ddz * 1000.0
 
-    # source RAS → CT IJK
-    ci = m00 * sx + m01 * sy + m02 * sz + m03
-    cj = m10 * sx + m11 * sy + m12 * sz + m13
-    ck = m20 * sx + m21 * sy + m22 * sz + m23
+    # Source RAS → CT IJK
+    ci = b00 * sx + b01 * sy + b02 * sz + b03
+    cj = b10 * sx + b11 * sy + b12 * sz + b13
+    ck = b20 * sx + b21 * sy + b22 * sz + b23
 
-    # sample original CT (trilinear)
     hu = _trilinear_sample_f(ct_data, ct_ni, ct_nj, ct_nk, ci, cj, ck)
 
-    # wound mask: near cut, no mass → air
+    # Wound mask: near cut, no mass → air
     m_val = _trilinear_sample_f(mass, ng, ng, ng, mx, my, mz)
     s_val = _trilinear_sample_f(cut_sdf, ng, ng, ng, mx, my, mz)
     if m_val < 1.0e-10 and wp.abs(s_val) > 0.0 and hu > -500.0:
@@ -696,56 +708,34 @@ class MPMCTHead:
         self._ct_ras2ijk = np.array(
             [[ras2ijk.GetElement(r, c) for c in range(4)] for r in range(4)])
 
-        # RAS positions for every CT voxel (pre-computed once)
-        M = np.array([[ijk2ras.GetElement(r, c) for c in range(4)]
-                       for r in range(4)])
-        ii, jj, kk = np.meshgrid(
-            np.arange(nI), np.arange(nJ), np.arange(nK), indexing='ij')
-        ijk_homo = np.stack([ii.ravel(), jj.ravel(), kk.ravel(),
-                             np.ones(nI * nJ * nK)], axis=1)
-        self._out_ras = (M @ ijk_homo.T).T[:, :3]  # (N, 3)
-
-        # Pre-compute MPM grid float indices for each output voxel
-        self._out_mpm_ijk = ((self._out_ras - offset) / 1000.0 / dx_m)
-
         # --- Upload CT to GPU (once) --------------------------------------
-        # Store as float32 in IJK order for the warp kernel
         ct_ijk = self._ct_arr.transpose(2, 1, 0).astype(np.float32).ravel()
+        nK, nJ, nI = self._ct_arr.shape
+        n_out = nI * nJ * nK
         with wp.ScopedDevice(self.device):
             self._ct_gpu = wp.array(ct_ijk, dtype=float)
+            self._out_gpu = wp.zeros(n_out, dtype=float)
 
-        # Output volume at a practical resolution (2× MPM grid = ~2mm)
-        out_dx_mm = dx_mm / 2.0
-        out_n = int(np.ceil(ng * dx_mm / out_dx_mm))
-        self._out_n = out_n
-        self._out_dx_mm = out_dx_mm
-        with wp.ScopedDevice(self.device):
-            self._out_gpu = wp.zeros(out_n ** 3, dtype=float)
+        # Store IJKToRAS matrix elements for the kernel
+        self._ijk2ras_elems = np.array(
+            [[ijk2ras.GetElement(r, c) for c in range(4)] for r in range(4)])
+        self._out_ni = nI
+        self._out_nj = nJ
+        self._out_nk = nK
 
-        ijk2ras_out = vtk.vtkMatrix4x4()
-        ijk2ras_out.Identity()
-        ijk2ras_out.SetElement(0, 0, out_dx_mm)
-        ijk2ras_out.SetElement(1, 1, out_dx_mm)
-        ijk2ras_out.SetElement(2, 2, out_dx_mm)
-        ijk2ras_out.SetElement(0, 3, offset[0])
-        ijk2ras_out.SetElement(1, 3, offset[1])
-        ijk2ras_out.SetElement(2, 3, offset[2])
-        self._out_ijk2ras = ijk2ras_out
-
-        # --- Create the DeformedCT volume --------------------------------
+        # --- Create the DeformedCT volume (same geometry as CT) ----------
         old = slicer.mrmlScene.GetFirstNodeByName('DeformedCT')
         if old:
             slicer.mrmlScene.RemoveNode(old)
 
-        empty = np.full((out_n, out_n, out_n), -1000, dtype=np.int16)
         self._deformed_ct = slicer.util.addVolumeFromArray(
-            empty, ijkToRAS=ijk2ras_out, name='DeformedCT')
+            self._ct_arr.copy(), ijkToRAS=ijk2ras, name='DeformedCT')
 
         # Initial resample
         self.update_deformed_ct()
 
-        print(f"MPMCTHead: CT uploaded to GPU ({len(ct_ijk)/1e6:.1f}M voxels), "
-              f"output grid {out_n}^3 at {out_dx_mm:.1f}mm")
+        print(f"MPMCTHead: CT uploaded to GPU ({n_out/1e6:.1f}M voxels), "
+              f"output {nI}×{nJ}×{nK} at full CT resolution")
 
         # --- Volume rendering with soft-tissue TF ------------------------
         vrLogic = slicer.modules.volumerendering.logic()
@@ -830,30 +820,33 @@ class MPMCTHead:
                            if self.sim.cut_sdfs
                            else wp.zeros(ng ** 3, dtype=float))
 
-            # RAS→IJK matrix elements
-            M = self._ct_ras2ijk
-            nK, nJ, nI = self._ct_arr.shape
+            A = self._ijk2ras_elems   # output IJK → RAS
+            B = self._ct_ras2ijk      # RAS → source CT IJK
             offset = self._ras_offset_mm
             dx_mm = self.sim.dx * 1000.0
-            on = self._out_n
+            nI, nJ, nK = self._out_ni, self._out_nj, self._out_nk
 
-            wp.launch(_resample_deformed_ct, dim=on ** 3, inputs=[
+            wp.launch(_resample_deformed_ct, dim=nI * nJ * nK, inputs=[
                 disp_x_gpu, disp_y_gpu, disp_z_gpu, mass_gpu, cut_sdf_gpu,
                 ng,
                 self._ct_gpu, nI, nJ, nK,
-                float(M[0, 0]), float(M[0, 1]), float(M[0, 2]), float(M[0, 3]),
-                float(M[1, 0]), float(M[1, 1]), float(M[1, 2]), float(M[1, 3]),
-                float(M[2, 0]), float(M[2, 1]), float(M[2, 2]), float(M[2, 3]),
-                on, on, on,
-                float(self._out_dx_mm),
+                # output IJK → RAS (A matrix)
+                float(A[0, 0]), float(A[0, 1]), float(A[0, 2]), float(A[0, 3]),
+                float(A[1, 0]), float(A[1, 1]), float(A[1, 2]), float(A[1, 3]),
+                float(A[2, 0]), float(A[2, 1]), float(A[2, 2]), float(A[2, 3]),
+                # RAS → source CT IJK (B matrix)
+                float(B[0, 0]), float(B[0, 1]), float(B[0, 2]), float(B[0, 3]),
+                float(B[1, 0]), float(B[1, 1]), float(B[1, 2]), float(B[1, 3]),
+                float(B[2, 0]), float(B[2, 1]), float(B[2, 2]), float(B[2, 3]),
+                nI, nJ, nK,
                 float(offset[0]), float(offset[1]), float(offset[2]),
                 float(dx_mm),
-                float(offset[0]), float(offset[1]), float(offset[2]),
                 self._out_gpu,
             ])
 
         # Download and update Slicer volume
-        result = self._out_gpu.numpy().reshape(on, on, on)
+        nI, nJ, nK = self._out_ni, self._out_nj, self._out_nk
+        result = self._out_gpu.numpy().reshape(nI, nJ, nK)
         out_kji = result.transpose(2, 1, 0).astype(np.int16)
 
         arr = slicer.util.arrayFromVolume(self._deformed_ct)
