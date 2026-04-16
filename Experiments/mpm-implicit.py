@@ -5,12 +5,13 @@ try:
     import newton
 except ModuleNotFoundError:
     slicer.util.pip_install("warp-lang")
-    #slicer.util.pip_install("git+https://github.com/nvidia/warp")
-    slicer.util.pip_install("git+https://github.com/newton-physics/newton")
+    slicer.util.pip_install("git+https://github.com/newton-physics/newton@v1.1.0")
 
 import numpy as np
 import warp as wp
 import qt
+import vtk
+import vtk.util.numpy_support
 
 import math
 
@@ -19,6 +20,7 @@ import newton.examples
 from newton.solvers import SolverImplicitMPM
 
 toMilli = 1000.
+
 
 def apply_attraction_force(
     particle_q: np.ndarray,
@@ -48,8 +50,7 @@ def apply_attraction_force(
     particle_f += forces
 
 
-
-class SlicerViewer():
+class SlicerViewer:
     def __init__(self):
         self.points = {}
         self.radii = {}
@@ -62,7 +63,6 @@ class SlicerViewer():
 
     def is_paused(self):
         return self.paused
-
 
     def set_model(self, model, particle_material):
         self.model = model
@@ -87,7 +87,6 @@ class SlicerViewer():
             material_scalars.InsertNextValue(material_id)
 
         polydata.GetPointData().SetScalars(material_scalars)
-
 
         for i in range(polydata.GetNumberOfPoints()):
             vertices.InsertNextCell(1)
@@ -127,7 +126,6 @@ class SlicerViewer():
             colorNode.SetColor(3, 0.75, 0.75, 0.8) # Snow
             colorNode.SetColor(4, 0.4, 0.25, 0.25) # Mud
 
-
         self.glyph3D = glyph3D
         self.pointsNode = pointsNode
 
@@ -150,6 +148,7 @@ class SlicerViewer():
     def close(self):
         pass
 
+
 class Example:
     def __init__(self, viewer, options):
         # setup simulation parameters first
@@ -164,6 +163,7 @@ class Example:
         # save a reference to the viewer
         self.viewer = viewer
         builder = newton.ModelBuilder()
+        SolverImplicitMPM.register_custom_attributes(builder)
         sand_particles, snow_particles, mud_particles = Example.emit_particles(builder, voxel_size=options.voxel_size)
 
         builder.add_ground_plane()
@@ -177,34 +177,26 @@ class Example:
         self.model.particle_kd = 0.0
         self.model.particle_mu = 0.1
 
-        mpm_options = SolverImplicitMPM.Options()
+        mpm_options = SolverImplicitMPM.Config()
         mpm_options.voxel_size = options.voxel_size
         mpm_options.tolerance = options.tolerance
         mpm_options.max_iterations = options.max_iterations
 
-        # Create MPM model from Newton model
-        mpm_model = SolverImplicitMPM.Model(self.model, mpm_options)
+        material_parameters = self.model.mpm
+        material_parameters.yield_pressure[snow_particles].fill_(1.0e20)
+        material_parameters.yield_stress[snow_particles].fill_(1.0e20)
+        material_parameters.tensile_yield_ratio[snow_particles].fill_(0.9)
+        material_parameters.friction[snow_particles].fill_(0.0)
+        material_parameters.hardening[snow_particles].fill_(1.0)
 
-        # multi-material setup
-        # some properties like elastic stiffness, damping, can be adjusted directly on the model,
-        # but not all yet. here we directly adjust the MPM model's material parameters
-
-        mpm_model.material_parameters.yield_pressure[snow_particles].fill_(1.0e20)
-        mpm_model.material_parameters.yield_stress[snow_particles].fill_(1.0e20)
-        mpm_model.material_parameters.tensile_yield_ratio[snow_particles].fill_(0.9)
-        mpm_model.material_parameters.friction[snow_particles].fill_(0.0)
-        mpm_model.material_parameters.hardening[snow_particles].fill_(1.0)
-
-        mpm_model.material_parameters.yield_pressure[mud_particles].fill_(1.0e20)
-        mpm_model.material_parameters.yield_stress[mud_particles].fill_(3.0e20)
-        mpm_model.material_parameters.tensile_yield_ratio[mud_particles].fill_(1.0)
-        mpm_model.material_parameters.hardening[mud_particles].fill_(2.0)
-        mpm_model.material_parameters.friction[mud_particles].fill_(0.0)
-
-        mpm_model.notify_particle_material_changed()
+        material_parameters.yield_pressure[mud_particles].fill_(1.0e20)
+        material_parameters.yield_stress[mud_particles].fill_(3.0e20)
+        material_parameters.tensile_yield_ratio[mud_particles].fill_(1.0)
+        material_parameters.hardening[mud_particles].fill_(2.0)
+        material_parameters.friction[mud_particles].fill_(0.0)
 
         # Initialize MPM solver
-        self.solver = SolverImplicitMPM(mpm_model, mpm_options)
+        self.solver = SolverImplicitMPM(self.model, mpm_options)
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -216,8 +208,6 @@ class Example:
         self.state_1.body_f = wp.zeros(
             shape=self.model.particle_count, dtype=wp.vec3, device=self.model.device
         )
-        self.solver.enrich_state(self.state_0)
-        self.solver.enrich_state(self.state_1)
 
         # Assign different colors to each particle type
         # Also assign material IDs to particles
@@ -344,7 +334,7 @@ class Example:
             flags=flags,
         )
 
-        if "snow" in builder.body_key: # Heuristic to identify snow particles
+        if "snow" in builder.body_label: # Heuristic to identify snow particles
             builder.add_spring_grid(
                 begin_id,
                 dim_x=res[0] + 1,
@@ -373,7 +363,7 @@ parser.add_argument("--voxel-size", "-dx", type=float, default=0.05)
 #viewer, args = newton.examples.init(parser)
 
 viewer = SlicerViewer()
-class Options():
+class Options:
     max_iterations = 25
     tolerance = 1.0e-6
     #voxel_size = 0.05
