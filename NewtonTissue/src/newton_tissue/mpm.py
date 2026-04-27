@@ -1697,6 +1697,7 @@ class MPMSimulator:
                           inputs=[
                               self.x, self.v, self.fixed, self.m_p,
                               self.fiber_i, self.fiber_j, self.fiber_l0, self.fiber_t,
+                              self.fiber_broken,
                               float(self.material.k_elastin),
                               float(self.material.k_collagen),
                               float(self.material.collagen_crimp),
