@@ -788,16 +788,31 @@ def _apply_hemisphere_contact(
     x:      wp.array(dtype=wp.vec3),
     v:      wp.array(dtype=wp.vec3),
     fixed:  wp.array(dtype=int),
+    m_p:    wp.array(dtype=float),
     sphere_center: wp.vec3,
     sphere_radius: float,
     response_rate: float,
     dt:     float,
+    sphere_vel: wp.vec3,     # rigid-body translational velocity [m/s]
+    stiction:   float,       # tangential velocity-match fraction per kick (0..1)
+    contact_impulse: wp.array(dtype=wp.vec3),
 ):
     """Lower-hemisphere rigid contact — applied BEFORE P2G.
 
     Any free particle in the lower hemisphere of the sphere receives an outward
     velocity kick proportional to penetration depth.  Applied before P2G so the
     modified velocities are scattered to the grid and captured by G2P in C and F.
+
+    Optional stiction: with stiction > 0 each in-contact particle's tangential
+    velocity is nudged toward the sphere's tangential velocity by a fraction
+    `stiction` per kick.  This is a velocity-match no-slip model — it engages
+    even at zero shear velocity, so the finger sticks to the deformed surface
+    instead of skidding off at large indentation.
+
+    The negated per-particle impulse (m * dv) — including BOTH the normal kick
+    and the tangential stiction kick — is atomically accumulated into
+    contact_impulse[0]; this is the Newton-3rd-law reaction on the rigid sphere
+    from the tissue, summed across all penetrating particles.
     """
     p = wp.tid()
     if fixed[p] != 0:
@@ -807,12 +822,24 @@ def _apply_hemisphere_contact(
     if dist < sphere_radius and dist > 1.0e-12 and delta[1] < 0.0:
         penetration = sphere_radius - dist
         normal = delta / dist
+
+        # --- Normal kick (penetration push-back) ---
         dv_mag = response_rate * penetration
         v_n = wp.dot(v[p], normal)
         if v_n < 0.0:
-            v[p] = v[p] + (dv_mag - v_n) * normal
+            dv = (dv_mag - v_n) * normal
         else:
-            v[p] = v[p] + dv_mag * normal
+            dv = dv_mag * normal
+
+        # --- Tangential stiction (velocity match against sphere) ---
+        if stiction > 0.0:
+            v_after    = v[p] + dv
+            v_t_now    = v_after    - wp.dot(v_after,    normal) * normal
+            v_t_target = sphere_vel - wp.dot(sphere_vel, normal) * normal
+            dv = dv + stiction * (v_t_target - v_t_now)
+
+        v[p] = v[p] + dv
+        wp.atomic_add(contact_impulse, 0, -m_p[p] * dv)
 
 
 @wp.kernel
@@ -1057,6 +1084,13 @@ class MPMSimulator:
         # P2G/G2P block transfers across each cut surface, and bonds that
         # cross the cut are broken.
         self.cut_sdfs = []
+
+        # Single-element vec3 buffer that step_with_contact zeros on entry and
+        # the contact kernel atomically accumulates the Newton-3rd-law impulse
+        # into.  Read after step_with_contact via last_contact_impulse / force.
+        with wp.ScopedDevice(device):
+            self._contact_impulse_buf = wp.zeros(1, dtype=wp.vec3)
+        self._last_contact_impulse_np = np.zeros(3, dtype=np.float32)
 
     def initialize_block_particles(
         self,
@@ -1604,6 +1638,8 @@ class MPMSimulator:
         gravity,
         sphere_center: np.ndarray,
         sphere_radius: float,
+        sphere_vel: np.ndarray = None,
+        stiction: float = 0.0,
     ):
         """Advance one timestep with rigid hemisphere contact.
 
@@ -1618,9 +1654,18 @@ class MPMSimulator:
             gravity:        gravity vector [m/s²]
             sphere_center:  3-vector, centre of rigid probe sphere [m]
             sphere_radius:  probe sphere radius [m] (finger tip ≈ 0.008–0.012 m)
+            sphere_vel:     optional 3-vector, sphere translational velocity
+                            [m/s].  Used by the stiction term; ignored if
+                            stiction == 0.  Defaults to zero.
+            stiction:       tangential velocity-match fraction per kick (0..1).
+                            0 = frictionless (default), 1 = full no-slip lock
+                            in one substep.  ~0.3 gives a noticeable grip with
+                            mild reaction force back on the sphere.
         """
         if gravity is None:
             gravity = np.array([0.0, -9.8, 0.0])
+        if sphere_vel is None:
+            sphere_vel = np.zeros(3)
         ng  = self.n_grid
         n   = self.n_particles
         dt  = float(self.dt)
@@ -1632,8 +1677,13 @@ class MPMSimulator:
         response_rate = c_s / float(sphere_radius)
         sc = wp.vec3(float(sphere_center[0]), float(sphere_center[1]),
                       float(sphere_center[2]))
+        sv = wp.vec3(float(sphere_vel[0]), float(sphere_vel[1]),
+                     float(sphere_vel[2]))
+        st = float(stiction)
 
         with wp.ScopedDevice(self.device):
+            self._contact_impulse_buf.zero_()
+
             if self.total_lagrangian and self.nbr_px is not None:
                 wp.launch(_recompute_F_total_lagrangian, dim=n,
                           inputs=[self.x, self.F,
@@ -1645,9 +1695,11 @@ class MPMSimulator:
             # Contact velocity kick BEFORE P2G — gets scattered to grid
             # so that G2P correctly captures the contact in C and F.
             wp.launch(_apply_hemisphere_contact, dim=n,
-                      inputs=[self.x, self.v, self.fixed,
+                      inputs=[self.x, self.v, self.fixed, self.m_p,
                               sc, float(sphere_radius),
-                              float(response_rate), dt])
+                              float(response_rate), dt,
+                              sv, st,
+                              self._contact_impulse_buf])
 
             wp.launch(_zero_grid, dim=ng**3,
                       inputs=[self.grid_v, self.grid_m])
@@ -1682,9 +1734,11 @@ class MPMSimulator:
 
             # Second contact kick after G2P — provides actual deformation.
             wp.launch(_apply_hemisphere_contact, dim=n,
-                      inputs=[self.x, self.v, self.fixed,
+                      inputs=[self.x, self.v, self.fixed, self.m_p,
                               sc, float(sphere_radius),
-                              float(response_rate), dt])
+                              float(response_rate), dt,
+                              sv, st,
+                              self._contact_impulse_buf])
 
             if self.bone_sdf is not None:
                 wp.launch(_apply_bone_sdf_contact, dim=n,
@@ -1714,3 +1768,24 @@ class MPMSimulator:
                               float(self.material.k_curve),
                               dt,
                           ])
+
+            self._last_contact_impulse_np = (
+                self._contact_impulse_buf.numpy()[0].astype(np.float32))
+
+    @property
+    def last_contact_impulse(self):
+        """Newton-3rd-law impulse on the rigid contact sphere from tissue [kg·m/s].
+
+        Total impulse summed across both pre-P2G and post-G2P kicks during the
+        most recent step_with_contact() call.  Zero before any contact step.
+        """
+        return self._last_contact_impulse_np
+
+    @property
+    def last_contact_force(self):
+        """Effective tissue→sphere reaction force over the last contact step [N].
+
+        impulse / dt — average force; appropriate for driving a force-coupled
+        rigid body whose state is updated once per step.
+        """
+        return self._last_contact_impulse_np / float(self.dt)

@@ -253,39 +253,59 @@ class TissueSimulationTest(ScriptedLoadableModuleTest):
     """
     slicer.mrmlScene.Clear(0)
 
-  def runTest(self,scenario=None):
-    """Run as few or as many tests as needed here.
+  # Map scenario name → bound test method, used by runTest to dispatch and to
+  # post a status-bar message before/after each run.
+  _SCENARIO_DISPATCH = {
+    "OneElement":               "test_TissueSimulation1",
+    "GluedBeam":                "test_TissueSimulation2",
+    "TwoElements":              "test_TissueSimulation3",
+    "Slab":                     "test_TissueSimulation_Slab",
+    "Subdivision":              "test_TissueSimulation_Subdivision",
+    "Stack3Compare":            "test_Stack3Compare",
+    "Newton":                   "test_NewtonPackage",
+    "MPM":                      "test_MPMSimulation",
+    "LayeredTissueHex":         "test_LayeredTissueHex",
+    "LayeredAnisotropicTissue": "test_LayeredAnisotropicTissue",
+    "ResolutionCompare":        "test_ResolutionCompare",
+    "WarpMPM":                  "test_WarpMPM",
+    "CTHeadMPM":                "test_CTHeadMPM",
+  }
+
+  def _setStatus(self, text, timeout_ms=0):
+    """Post a message in the Slicer main-window status bar.
+
+    timeout_ms=0 means persistent (until replaced).  A positive value
+    auto-clears after that many milliseconds.
+    """
+    try:
+      slicer.util.mainWindow().statusBar().showMessage(text, timeout_ms)
+      slicer.app.processEvents()
+    except Exception:
+      pass
+
+  def runTest(self, scenario=None):
+    """Dispatch to the requested scenario's test method, posting
+    "Running <name>..." in the status bar before the run and
+    "<name>: passed" / "<name>: failed — <msg>" afterward.
+    Result messages auto-clear after 10 s.
     """
     self.setUp()
-    if scenario is None or scenario == "OneElement":
-      self.test_TissueSimulation1()
-    elif scenario == "GluedBeam":
-      self.test_TissueSimulation2()
-    elif scenario == "TwoElements":
-      self.test_TissueSimulation3()
-    elif scenario == "Slab":
-      self.test_TissueSimulation_Slab()
-    elif scenario == "Subdivision":
-      self.test_TissueSimulation_Subdivision()
-    elif scenario == "Stack3Compare":
-      self.test_Stack3Compare()
-    elif scenario == "Newton":
-      self.test_NewtonPackage()
-    elif scenario == "MPM":
-      self.test_MPMSimulation()
-    elif scenario == "LayeredTissueHex":
-      self.test_LayeredTissueHex()
-    elif scenario == "LayeredAnisotropicTissue":
-      self.test_LayeredAnisotropicTissue()
-    elif scenario == "ResolutionCompare":
-      self.test_ResolutionCompare()
-    elif scenario == "WarpMPM":
-      self.test_WarpMPM()
-    elif scenario == "CTHeadMPM":
-      self.test_CTHeadMPM()
-    else:
+    if scenario is None:
+      scenario = "OneElement"
+    method_name = self._SCENARIO_DISPATCH.get(scenario)
+    if method_name is None:
+      self._setStatus(f"Unknown test scenario: {scenario}", 10_000)
       self.delayDisplay(f"Unknown test scenario: {scenario}", 3000)
       self.fail(f"Unknown test scenario: {scenario}")
+      return
+
+    self._setStatus(f"Running {scenario}...")
+    try:
+      getattr(self, method_name)()
+    except Exception as e:
+      self._setStatus(f"{scenario}: failed — {e}", 10_000)
+      raise
+    self._setStatus(f"{scenario}: passed", 10_000)
 
   def test_TissueSimulation1(self):
     """ Ideally you should have several levels of tests.  At the lowest level
@@ -1103,28 +1123,21 @@ class TissueSimulationTest(ScriptedLoadableModuleTest):
         f"Gravity OK — free mean Y: {y_disp_free.mean()*1000:.2f} mm, "
         f"fixed max Y: {abs(y_disp_fixed).max()*1e6:.1f} µm", 600)
 
-    # --- 2. Displacement-controlled push via simulation loop ---
-    # Ramp probe sphere 0 → 15 mm into tissue over 60 levels × 150 ms each.
-    # The rigid sphere contact pushes particles radially outward, creating a
-    # smooth bowl-shaped depression like a real finger pressing into tissue.
+    # --- 2. Force-driven push via simulation loop ---
+    # Ramp the target 0 → 15 mm into tissue over 60 levels × 150 ms each.
+    # The dynamic finger sphere trails the target via a spring; tissue
+    # reaction limits how far the finger penetrates.  Total finger excursion
+    # will be less than 15 mm — this test verifies that the tissue deforms
+    # under the contact, not that the finger reaches a specific depth.
     self.delayDisplay("Pressing finger into tissue...", 400)
     import qt as _qt
-    push_depth_m = 0.015    # 15 mm total push
+    push_depth_m = 0.015    # 15 mm of fiducial pull-down
     n_ramp       = 60       # displacement levels
     ms_per_level = 150      # ms between increments (sim loop fires freely)
-    rest_pos_m   = sim._palp_pos_mm / 1000.0
 
     for i in range(n_ramp):
       depth = push_depth_m * (i + 1) / n_ramp
-      fid_pos = rest_pos_m + numpy.array([0.0, -depth, 0.0])
-      sphere_c = sim._sphere_center_for_fiducial(fid_pos)
-      sim._contact_sphere = {
-        'center': sphere_c,
-        'radius': sim._probe_radius,
-      }
-      sim._idle_ticks = 0
-      if not sim._loop_running:
-        sim.start_simulation_loop()
+      sim.set_target_depth_m(depth)
       _loop = _qt.QEventLoop()
       _qt.QTimer.singleShot(ms_per_level, _loop.quit)
       _loop.exec_()
@@ -1155,25 +1168,16 @@ class TissueSimulationTest(ScriptedLoadableModuleTest):
         f"Finger at {abs(dy_push_mm):.1f} mm depth — releasing.", 1500)
 
     # --- 3. Finger lifts off gradually (like a real finger) ---
-    # Ramp sphere back out over 30 levels so F tracks the withdrawal.
+    # Ramp the target back out over 30 levels so the spring decays the
+    # finger off the surface.
     n_withdraw = 30
     for i in range(n_withdraw):
       frac = 1.0 - (i + 1) / n_withdraw
-      depth = push_depth_m * frac
-      fid_pos = rest_pos_m + numpy.array([0.0, -depth, 0.0])
-      sphere_c = sim._sphere_center_for_fiducial(fid_pos)
-      sim._contact_sphere = {
-        'center': sphere_c,
-        'radius': sim._probe_radius,
-      }
-      sim._idle_ticks = 0
-      if not sim._loop_running:
-        sim.start_simulation_loop()
+      sim.set_target_depth_m(push_depth_m * frac)
       _loop = _qt.QEventLoop()
       _qt.QTimer.singleShot(ms_per_level, _loop.quit)
       _loop.exec_()
 
-    sim._contact_sphere = None
     sim.recover(n_steps=2000, show_every=5)
 
     # --- 4. Check elastic recovery ---

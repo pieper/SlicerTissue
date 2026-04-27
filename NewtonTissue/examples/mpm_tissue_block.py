@@ -16,7 +16,9 @@ from newton_tissue.mpm import MPMMaterial, MPMSimulator
 BLOCK_SIZE = 0.08
 N_GRID     = 32
 PPC        = 2
-DT         = 2e-4
+# CFL: dt < dx / c_s.  At E=30 kPa, ν=0.48, ρ=1060 → c_s ≈ 15.8 m/s,
+# dx = 2.5 mm gives dt_max ≈ 1.58e-4.  Run at 1e-4 for ~60% margin.
+DT         = 1e-4
 GRAVITY    = np.array([0.0, -9.8, 0.0])
 
 # Material calibrated against soft-tissue mechanical testing literature:
@@ -33,14 +35,43 @@ GRAVITY    = np.array([0.0, -9.8, 0.0])
 #   k_curve=0   — disabled: Updated Lagrangian mode handles large deformation correctly;
 #                 the fiber network (elastin+collagen bonds) provides lattice connectivity.
 #   damping     — 0.995: near-critically damped (Q≈1.1) vs overdamped (Q≈0.54 at 0.99).
-MATERIAL         = MPMMaterial(E=10_000.0, nu=0.48, rho=1_060.0,
-                               k_elastin=0.05, k_collagen=0.25, collagen_crimp=0.05,
+MATERIAL         = MPMMaterial(E=30_000.0, nu=0.48, rho=1_060.0,
+                               k_elastin=0.5, k_collagen=2.0, collagen_crimp=0.05,
                                k_curve=0.0)
 VELOCITY_DAMPING = 0.995
 
-# Probe geometry: rigid sphere contact for displacement-controlled palpation.
-# Sphere radius ≈ fingertip: 4×dx ≈ 10 mm.
-PROBE_RADIUS_DX  = 4.0     # probe radius in multiples of grid spacing
+# Probe geometry: rigid sphere contact for force-driven palpation.
+# Sphere radius ≈ palm/fingertip pad: 8×dx ≈ 20 mm.  Larger probe distributes
+# contact force over a wider tissue patch so deformation spreads naturally.
+PROBE_RADIUS_DX  = 8.0     # probe radius in multiples of grid spacing
+
+# Two-body palpation: a fiducial-controlled "target" expresses the user's
+# intended push direction/depth, and a force-driven "finger" sphere trails the
+# target via a spring.  The finger never penetrates beyond what tissue
+# resistance allows — so dragging the target deeper just makes the finger push
+# harder, not deeper, until the spring force matches the tissue reaction.
+#
+# Spring law is a sublinear power form:
+#     F = SPRING_K · ((1 + d/SPRING_D0)^SPRING_P − 1)
+#
+# Near rest (d ≪ d0): F ≈ (SPRING_K · SPRING_P / SPRING_D0) · d  — linear,
+# with effective stiffness k_eff = K·p/d0.  Far from rest: F ∝ d^p.
+# SPRING_P = 1 recovers a linear spring; SPRING_P → 0 recovers the
+# logarithmic limit.  The default p=0.5 (square-root) sits between linear
+# and log: gentler than linear (so fine penetration is controllable) but
+# rises faster than log (so the operator still feels increasing resistance
+# at deep target offsets).
+FINGER_REST_GAP_DX = 0.5    # clearance between finger and tissue at rest [×dx]
+FINGER_MASS_KG     = 0.050  # ~50 g, typical fingertip mass
+SPRING_K           = 4.0    # N: power-spring scale
+SPRING_D0          = 0.005  # m: characteristic distance — 5 mm
+SPRING_P           = 0.5    # power-law exponent (0 < p < 1: sublinear)
+FINGER_DAMPING     = 4.0    # N·s/m: ≈ 2·sqrt(k_eff·m) at small d
+# Stiction: fraction per kick at which in-contact tissue particles are
+# velocity-matched to the sphere's tangential motion.  Engages even at zero
+# shear velocity, so the finger sticks to the deformed surface instead of
+# skidding off when the user drags the fiducial laterally.  0 = frictionless.
+FINGER_STICTION    = 0.3
 
 
 class MPMTissueBlock:
@@ -81,33 +112,58 @@ class MPMTissueBlock:
             (np.abs(pos[:, 0] - center) < xz_range) &
             (np.abs(pos[:, 2] - center) < xz_range)
         )
-        palp_pos = pos[self._palp_mask].mean(axis=0) * 1000.0
-        self._palp_pos_mm = palp_pos.copy()
 
-        # The fiducial sits at the tissue surface.  The probe sphere centre
-        # is offset upward by sphere_radius so it just touches the surface
-        # at rest and pushes inward when the fiducial is dragged down.
-        self._surface_y = float(BLOCK_SIZE)   # top of block [m]
+        # Rest geometry of the two-body palpation system:
+        #   surface  :  top of the tissue block.
+        #   finger   :  sphere whose lower surface sits FINGER_REST_GAP above the
+        #               tissue at rest, so no contact occurs with the probe idle.
+        #   target   :  same xz as finger, same y at rest — the fiducial.  Drag
+        #               the fiducial below the rest position to load the spring
+        #               connecting target → finger.
+        self._surface_y = float(BLOCK_SIZE)
+        self._rest_gap_m = FINGER_REST_GAP_DX * self.sim.dx
+        finger_y_rest = self._surface_y + self._probe_radius + self._rest_gap_m
+        palp_xz = pos[self._palp_mask].mean(axis=0)[[0, 2]]
+        self._palp_pos_mm = np.array([
+            palp_xz[0] * 1000.0,
+            finger_y_rest * 1000.0,
+            palp_xz[1] * 1000.0,
+        ], dtype=float)
 
+        # 1500 steps × 1e-4 s = 0.15 s of warm-up — long enough for the
+        # damping=0.995 envelope to reach <10 µm/tick after the half-step
+        # CFL change.
         self.sim.step(GRAVITY)
-        for _ in range(749):  # 750 total: enough for damping=0.995 to reach <10um/tick
+        for _ in range(1499):
             self.sim.step(GRAVITY)
         self.sim.sample_equilibrium()
+
+        # Two-body palpation state (m, m/s, kg).
+        self._target_pos_m = (self._palp_pos_mm / 1000.0).astype(np.float64)
+        self._finger_pos_m = self._target_pos_m.copy()
+        self._finger_vel_m = np.zeros(3, dtype=np.float64)
+        self._finger_mass  = float(FINGER_MASS_KG)
+        self._spring_k     = float(SPRING_K)
+        self._spring_d0    = float(SPRING_D0)
+        self._spring_p     = float(SPRING_P)
+        self._finger_damp  = float(FINGER_DAMPING)
+        self._stiction     = float(FINGER_STICTION)
 
         self.vtk_model    = None
         self._vtk_points  = None
         self._vtk_poly    = None
         self.fiducial_list = None
+        self._finger_model = None
+        self._finger_transform = None
         self._updating    = False
         self.grid_volume  = None
 
         # simulation loop state
         self._loop_running          = False
-        self._steps_per_tick        = 10
+        self._steps_per_tick        = 20    # 2× to compensate for halved dt
         self._tick_interval_ms      = 50
         self._idle_ticks            = 0
         self._idle_ticks_to_stop    = 5
-        self._contact_sphere        = None    # {'center': [m], 'radius': [m]} or None
         self._prev_tick_pos         = None
         self._observer_tags         = []
 
@@ -120,6 +176,7 @@ class MPMTissueBlock:
         if _has_slicer:
             self._create_vtk_model()
             self._create_fiducial()
+            self._create_finger_model()
             self._create_grid_volume()
             self.update_model()
             self._setup_view()
@@ -139,6 +196,7 @@ class MPMTissueBlock:
             self._vtk_poly.Modified()
             if self.vtk_model:
                 self.vtk_model.GetPolyData().Modified()
+        self._update_finger_model()
         self._update_grid_volume()
 
     # ------------------------------------------------------------------
@@ -190,19 +248,19 @@ class MPMTissueBlock:
             return
 
         for _ in range(self._steps_per_tick):
-            if self._contact_sphere is not None:
-                cs = self._contact_sphere
-                self.sim.step_with_contact(GRAVITY, cs['center'], cs['radius'])
-            else:
-                self.sim.step(GRAVITY)
+            self._advance_finger_and_step()
 
         pos_now = self.sim.get_positions()
         self.update_model()
 
         if self._prev_tick_pos is not None:
-            # Threshold-based idle check: stop when tissue reaches equilibrium.
-            # Works with or without active probe (probe holds tissue in place).
-            if float(np.abs(pos_now - self._prev_tick_pos).max()) < 2e-5:
+            # Idle when both tissue and finger are at rest.  Always run a
+            # contact step here — the finger may still be moving even when
+            # the tissue is settled, and the kernel skips work cheaply when
+            # the sphere is fully clear of every particle.
+            tissue_idle = float(np.abs(pos_now - self._prev_tick_pos).max()) < 2e-5
+            finger_idle = float(np.abs(self._finger_vel_m).max()) < 1e-4
+            if tissue_idle and finger_idle:
                 self._idle_ticks += 1
             else:
                 self._idle_ticks = 0
@@ -213,6 +271,57 @@ class MPMTissueBlock:
             return
         self._schedule_tick()
 
+    def _advance_finger_and_step(self):
+        """Advance finger one substep (force-driven), then step the MPM sim.
+
+        The finger is a 1-DOF rigid body coupled to the user's target by a
+        sublinear power-spring (toward target) and a damper (on its own
+        velocity), with the Newton-3rd-law tissue reaction read back from
+        the previous step.
+        """
+        dt = float(self.sim.dt)
+        delta = self._target_pos_m - self._finger_pos_m
+        d = float(np.linalg.norm(delta))
+        if d > 1e-9:
+            f_mag = self._spring_k * ((1.0 + d / self._spring_d0) ** self._spring_p - 1.0)
+            F_spring = (f_mag / d) * delta
+        else:
+            F_spring = np.zeros(3)
+        F_damp   = -self._finger_damp * self._finger_vel_m
+        F_react  = self.sim.last_contact_force          # 0 before any contact step
+        F_total  = F_spring + F_damp + F_react
+
+        self._finger_vel_m += (F_total / self._finger_mass) * dt
+        self._finger_pos_m += self._finger_vel_m * dt
+
+        self.sim.step_with_contact(GRAVITY, self._finger_pos_m, self._probe_radius,
+                                   sphere_vel=self._finger_vel_m,
+                                   stiction=self._stiction)
+
+    # ------------------------------------------------------------------
+    # Public API for driving the target
+    # ------------------------------------------------------------------
+
+    def set_target_position_m(self, pos_m):
+        """Set the target (palpation goal) position in metres.
+
+        The finger is pulled toward this point by the spring; tissue reaction
+        decides how close the finger actually gets.
+        """
+        self._target_pos_m = np.asarray(pos_m, dtype=np.float64).copy()
+        self._idle_ticks   = 0
+        if not self._loop_running:
+            self.start_simulation_loop()
+
+    def set_target_depth_m(self, depth_m):
+        """Drag the target straight down by depth_m relative to its rest pose.
+
+        depth_m > 0 means the user is pushing into the tissue.  Convenience
+        wrapper around set_target_position_m for the common 1-D test case.
+        """
+        rest = self._palp_pos_mm / 1000.0
+        self.set_target_position_m(rest + np.array([0.0, -float(depth_m), 0.0]))
+
     def _on_scene_about_to_close(self, _scene, _event):
         self.stop_simulation_loop()
 
@@ -220,23 +329,21 @@ class MPMTissueBlock:
     # Palpation (displacement-controlled rigid sphere contact)
     # ------------------------------------------------------------------
 
-    def _sphere_center_for_fiducial(self, fiducial_pos_m):
-        """Compute rigid sphere centre from fiducial position.
-
-        The sphere centre sits one radius above the fiducial so that at rest
-        (fiducial at tissue surface) the sphere just touches the surface.
-        """
-        return fiducial_pos_m + np.array([0.0, self._probe_radius, 0.0])
-
     def apply_palpation(self, push_depth_m=0.015, n_steps=500, show_every=0):
-        """Push a rigid sphere into tissue by push_depth_m, then hold."""
+        """Ramp the target down by push_depth_m over n_steps and let the
+        force-driven finger settle against the tissue.
+
+        The finger does NOT move rigidly with the target — it trails behind
+        and stops at force balance.  push_depth_m therefore represents user
+        intent (how deep the user is pulling the fiducial), not measured
+        deformation.  Use sim.last_contact_force to read the reaction force.
+        """
         self._loop_running = False
         rest_m = self._palp_pos_mm / 1000.0
         for i in range(n_steps):
             frac = min(1.0, (i + 1) / n_steps)
-            fid_pos = rest_m + np.array([0.0, -push_depth_m * frac, 0.0])
-            sphere_c = self._sphere_center_for_fiducial(fid_pos)
-            self.sim.step_with_contact(GRAVITY, sphere_c, self._probe_radius)
+            self._target_pos_m = rest_m + np.array([0.0, -push_depth_m * frac, 0.0])
+            self._advance_finger_and_step()
             if show_every > 0 and i % show_every == show_every - 1:
                 self.update_model()
                 try:
@@ -246,11 +353,12 @@ class MPMTissueBlock:
                     pass
 
     def recover(self, n_steps=1500, show_every=5):
-        """Release probe and let tissue recover elastically."""
+        """Release probe (target back to rest above surface) and let tissue
+        and finger relax."""
         self._loop_running = False
-        self._contact_sphere = None
+        self._target_pos_m = (self._palp_pos_mm / 1000.0).astype(np.float64).copy()
         for i in range(n_steps):
-            self.sim.step(GRAVITY)
+            self._advance_finger_and_step()
             if show_every > 0 and i % show_every == show_every - 1:
                 self.update_model()
                 try:
@@ -371,36 +479,51 @@ class MPMTissueBlock:
             self.fiducial_list.PointModifiedEvent,
             lambda c, e: self._on_fiducial_moved(c))
 
+    def _create_finger_model(self):
+        """Sphere model node showing the dynamic finger position.
+
+        Linked to a transform node whose translation is updated each tick.
+        """
+        import slicer, vtk
+        src = vtk.vtkSphereSource()
+        src.SetRadius(self._probe_radius * 1000.0)   # mm
+        src.SetThetaResolution(24)
+        src.SetPhiResolution(24)
+        src.Update()
+        self._finger_model = slicer.mrmlScene.AddNewNodeByClass(
+            'vtkMRMLModelNode', 'MPMFinger')
+        self._finger_model.SetAndObservePolyData(src.GetOutput())
+        self._finger_model.CreateDefaultDisplayNodes()
+        dn = self._finger_model.GetDisplayNode()
+        dn.SetColor(0.4, 0.7, 1.0)
+        dn.SetOpacity(0.7)
+        self._finger_transform = slicer.mrmlScene.AddNewNodeByClass(
+            'vtkMRMLLinearTransformNode', 'MPMFingerTransform')
+        self._finger_model.SetAndObserveTransformNodeID(
+            self._finger_transform.GetID())
+        self._update_finger_model()
+
+    def _update_finger_model(self):
+        if self._finger_transform is None:
+            return
+        import vtk
+        m = vtk.vtkMatrix4x4()
+        m.Identity()
+        m.SetElement(0, 3, self._finger_pos_m[0] * 1000.0)
+        m.SetElement(1, 3, self._finger_pos_m[1] * 1000.0)
+        m.SetElement(2, 3, self._finger_pos_m[2] * 1000.0)
+        self._finger_transform.SetMatrixTransformToParent(m)
+
     def _on_fiducial_moved(self, fiducial_list):
+        """Fiducial drives the target only — finger trails it via the spring.
+
+        The fiducial's RAS position (mm) is taken verbatim as the new target,
+        no offset.  Force-driven contact handles the rest.
+        """
         p = [0.0, 0.0, 0.0]
         fiducial_list.GetNthControlPointPosition(0, p)
-        p_mm     = np.array(p)
-        delta_mm = p_mm - self._palp_initial_mm   # displacement from rest
-        dist_mm  = float(np.linalg.norm(delta_mm))
-
-        if dist_mm < 0.5:
-            # Probe returned to rest — release contact
-            self._contact_sphere = None
-            self._idle_ticks     = 0
-            if not self._loop_running:
-                self.start_simulation_loop()
-            return
-
-        # Displacement-controlled rigid sphere contact.
-        # The sphere centre is offset upward by probe_radius from the fiducial
-        # so it just touches the tissue surface at rest.  Dragging the fiducial
-        # into the tissue pushes the sphere in, displacing particles.
-        fid_pos_m = p_mm / 1000.0
-        sphere_c  = self._sphere_center_for_fiducial(fid_pos_m)
-        self._contact_sphere = {
-            'center': sphere_c,
-            'radius': self._probe_radius,
-        }
-        self._palp_pos_mm  = p_mm
-        self._palp_ref_pos = p_mm
-        self._idle_ticks   = 0
-        if not self._loop_running:
-            self.start_simulation_loop()
+        self.set_target_position_m(np.array(p) / 1000.0)
+        self._palp_ref_pos = np.array(p)
 
 
 if __name__ == '__main__':
