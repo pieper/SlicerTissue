@@ -147,6 +147,20 @@ HU_BONE_MIN = 300
 
 EARTH_G = 9.81   # m/s²
 
+# --- Palpation (force-driven finger + spring-coupled fiducial target) ------
+# Matches the tunings used in mpm_tissue_block.py.  Probe radius scales with
+# the grid spacing (8 × dx ≈ 32 mm at dx_mm=4: roughly a palm pad), and the
+# sublinear power-spring gives gentle near-rest control with rising resistance
+# at depth so the finger never penetrates further than tissue reaction allows.
+PROBE_RADIUS_DX    = 8.0     # probe radius in multiples of grid spacing
+FINGER_REST_GAP_DX = 0.5     # clearance between finger and tissue at rest [×dx]
+FINGER_MASS_KG     = 0.050   # ~50 g, typical fingertip mass
+SPRING_K           = 4.0     # N: power-spring scale
+SPRING_D0          = 0.005   # m: characteristic distance — 5 mm
+SPRING_P           = 0.5     # power-law exponent (0 < p < 1: sublinear)
+FINGER_DAMPING     = 4.0     # N·s/m: ≈ 2·sqrt(k_eff·m) at small d
+FINGER_STICTION    = 0.3     # tangential velocity-match fraction per kick
+
 
 # ---------------------------------------------------------------------------
 # Data download
@@ -253,13 +267,47 @@ class MPMCTHead:
         self._idle_ticks_to_stop = 20
         self._prev_tick_pos = None
         self._observer_tags = []
-        self._contact_sphere = None
         self._slider        = None
         self._toolbar       = None
         self._deformed_ct        = None
         self._vr_display_node    = None
         self._last_ct_update     = 0.0
         self._ct_update_interval = 0.2   # seconds between CT resamples
+
+        # --- Palpation finger state -----------------------------------
+        # Rest pose: pick the superior-most tissue (non-fixed) particle so the
+        # finger spawns just above the visible head surface in any orientation.
+        pos_sim   = self.sim.get_positions()                       # [m]
+        free_mask = ~self.sim.fixed.numpy().astype(bool)
+        free_pos  = pos_sim[free_mask]
+        top_idx   = int(np.argmax(free_pos[:, 2]))                 # +Z = +S
+        top_sim   = free_pos[top_idx]
+        self._probe_radius = PROBE_RADIUS_DX * self.sim.dx         # [m]
+        self._rest_gap_m   = FINGER_REST_GAP_DX * self.sim.dx
+
+        # Sim-space finger rest position: probe centred above the topmost
+        # particle by radius + clearance gap.
+        finger_rest_sim = top_sim.astype(np.float64).copy()
+        finger_rest_sim[2] += self._probe_radius + self._rest_gap_m
+
+        # Cache the RAS-mm rest pose so the fiducial can spawn there.
+        self._palp_pos_mm = finger_rest_sim * 1000.0 + self._ras_offset_mm
+
+        # Two-body palpation state (sim metres).
+        self._target_pos_m = finger_rest_sim.copy()
+        self._finger_pos_m = finger_rest_sim.copy()
+        self._finger_vel_m = np.zeros(3, dtype=np.float64)
+        self._finger_mass  = float(FINGER_MASS_KG)
+        self._spring_k     = float(SPRING_K)
+        self._spring_d0    = float(SPRING_D0)
+        self._spring_p     = float(SPRING_P)
+        self._finger_damp  = float(FINGER_DAMPING)
+        self._stiction     = float(FINGER_STICTION)
+
+        # Slicer-side palpation nodes (created in run()).
+        self.fiducial_list     = None
+        self._finger_model     = None
+        self._finger_transform = None
 
     # ------------------------------------------------------------------
     # Particle setup
@@ -574,6 +622,8 @@ class MPMCTHead:
             return
         self._create_vtk_model()
         self._create_gravity_slider()
+        self._create_finger_model()
+        self._create_fiducial()
         # Show the deformed CT volume rendering from the start so the
         # user can place curve points on the skin surface.  The point
         # model is hidden; it can be re-enabled from the Data module.
@@ -629,11 +679,7 @@ class MPMCTHead:
 
         g = self.gravity * self._gravity_scale
         for _ in range(self._steps_per_tick):
-            if self._contact_sphere is not None:
-                cs = self._contact_sphere
-                self.sim.step_with_contact(g, cs['center'], cs['radius'])
-            else:
-                self.sim.step(g)
+            self._advance_finger_and_step(g)
 
         pos_now = self.sim.get_positions()
         vr_visible = (self._vr_display_node is not None
@@ -649,6 +695,7 @@ class MPMCTHead:
                 dn = self.vtk_model.GetDisplayNode()
                 if dn and dn.GetVisibility():
                     dn.SetVisibility(False)
+            self._update_finger_model()
         else:
             # Show and update point model when VR is hidden
             if self.vtk_model:
@@ -674,11 +721,112 @@ class MPMCTHead:
         self.stop_simulation_loop()
 
     # ------------------------------------------------------------------
+    # Palpation (force-driven finger trailing a fiducial-controlled target)
+    # ------------------------------------------------------------------
+
+    def _advance_finger_and_step(self, gravity):
+        """Advance finger one substep (force-driven), then step the MPM sim.
+
+        Spring (sublinear power form) pulls the finger toward the target;
+        damper acts on the finger's own velocity; tissue reaction from the
+        previous step is the Newton-3rd-law feedback.  Tangential stiction
+        in step_with_contact lets the finger drag the surface laterally —
+        which is what pulls the wound open across a cut.
+        """
+        dt = float(self.sim.dt)
+        delta = self._target_pos_m - self._finger_pos_m
+        d = float(np.linalg.norm(delta))
+        if d > 1e-9:
+            f_mag = self._spring_k * ((1.0 + d / self._spring_d0) ** self._spring_p - 1.0)
+            F_spring = (f_mag / d) * delta
+        else:
+            F_spring = np.zeros(3)
+        F_damp  = -self._finger_damp * self._finger_vel_m
+        F_react = self.sim.last_contact_force        # 0 before any contact step
+        F_total = F_spring + F_damp + F_react
+
+        self._finger_vel_m += (F_total / self._finger_mass) * dt
+        self._finger_pos_m += self._finger_vel_m * dt
+
+        self.sim.step_with_contact(gravity, self._finger_pos_m, self._probe_radius,
+                                   sphere_vel=self._finger_vel_m,
+                                   stiction=self._stiction)
+
+    def set_target_position_m(self, pos_m):
+        """Set the palpation target in sim metres.  The finger trails via spring."""
+        self._target_pos_m = np.asarray(pos_m, dtype=np.float64).copy()
+        self._idle_ticks   = 0
+        if not self._loop_running:
+            self.start_simulation_loop()
+
+    def set_target_depth_m(self, depth_m):
+        """Drag the target straight down (–S) by depth_m from its rest pose."""
+        rest = (self._palp_pos_mm - self._ras_offset_mm) / 1000.0
+        self.set_target_position_m(rest + np.array([0.0, 0.0, -float(depth_m)]))
+
+    def _create_fiducial(self):
+        """Create the palpation fiducial at the head's superior rest pose."""
+        import slicer
+        self.fiducial_list = slicer.mrmlScene.AddNewNodeByClass(
+            'vtkMRMLMarkupsFiducialNode', 'CTHeadPalpationPoint')
+        dn = self.fiducial_list.GetDisplayNode()
+        dn.SetGlyphTypeFromString('Sphere3D')
+        dn.SetGlyphScale(4.0)
+        dn.SetColor(1.0, 0.3, 0.3)
+        x, y, z = self._palp_pos_mm
+        self.fiducial_list.AddControlPoint(x, y, z)
+        self.fiducial_list.SetNthControlPointLabel(0, 'palp')
+        self.fiducial_list.AddObserver(
+            self.fiducial_list.PointModifiedEvent,
+            lambda c, e: self._on_fiducial_moved(c))
+
+    def _create_finger_model(self):
+        """Sphere model linked to a transform that tracks the finger position."""
+        import slicer, vtk
+        src = vtk.vtkSphereSource()
+        src.SetRadius(self._probe_radius * 1000.0)   # mm
+        src.SetThetaResolution(24)
+        src.SetPhiResolution(24)
+        src.Update()
+        self._finger_model = slicer.mrmlScene.AddNewNodeByClass(
+            'vtkMRMLModelNode', 'CTHeadFinger')
+        self._finger_model.SetAndObservePolyData(src.GetOutput())
+        self._finger_model.CreateDefaultDisplayNodes()
+        dn = self._finger_model.GetDisplayNode()
+        dn.SetColor(0.4, 0.7, 1.0)
+        dn.SetOpacity(0.7)
+        self._finger_transform = slicer.mrmlScene.AddNewNodeByClass(
+            'vtkMRMLLinearTransformNode', 'CTHeadFingerTransform')
+        self._finger_model.SetAndObserveTransformNodeID(
+            self._finger_transform.GetID())
+        self._update_finger_model()
+
+    def _update_finger_model(self):
+        if self._finger_transform is None:
+            return
+        import vtk
+        ras = self._finger_pos_m * 1000.0 + self._ras_offset_mm
+        m = vtk.vtkMatrix4x4()
+        m.Identity()
+        m.SetElement(0, 3, float(ras[0]))
+        m.SetElement(1, 3, float(ras[1]))
+        m.SetElement(2, 3, float(ras[2]))
+        self._finger_transform.SetMatrixTransformToParent(m)
+
+    def _on_fiducial_moved(self, fiducial_list):
+        """Fiducial RAS position is the new target (sim metres after offset)."""
+        p = [0.0, 0.0, 0.0]
+        fiducial_list.GetNthControlPointPosition(0, p)
+        ras_mm = np.array(p, dtype=np.float64)
+        self.set_target_position_m((ras_mm - self._ras_offset_mm) / 1000.0)
+
+    # ------------------------------------------------------------------
     # Visualisation
     # ------------------------------------------------------------------
 
     def update_model(self):
         if self._vtk_points is None:
+            self._update_finger_model()
             return
         import vtk, vtk.util.numpy_support as ns
         pos_mm = (self.sim.get_positions() * 1000.0
@@ -689,6 +837,7 @@ class MPMCTHead:
         self._vtk_poly.Modified()
         if self.vtk_model:
             self.vtk_model.GetPolyData().Modified()
+        self._update_finger_model()
 
     def setup_deformed_ct(self):
         """Create a resampled deformed CT with wound cavity visualization.
