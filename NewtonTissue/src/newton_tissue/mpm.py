@@ -1714,17 +1714,53 @@ class MPMSimulator:
 
     @property
     def wave_speed(self):
-        """Elastic wave speed of the STIFFEST particle, sqrt(E_max/rho) [m/s]."""
+        """Rod wave speed of the stiffest particle, sqrt(E_max/rho) [m/s].
+
+        NOT the CFL bound -- see p_wave_speed.  This is kept as the reference
+        speed for the contact response rate, where it is a tuned parameter
+        rather than a stability limit.
+        """
         return float(np.sqrt(self._E_max / self.material.rho))
 
-    def cfl_dt(self, cfl: float = 0.18, dt_max: float = 2.0e-4) -> float:
-        """CFL-limited timestep, min(dt_max, cfl * dx / c_s).
+    @property
+    def p_wave_speed(self):
+        """Dilatational (P-wave) speed of the stiffest particle [m/s].
 
-        c_s comes from the stiffest particle, so a heterogeneous model is
-        stable everywhere.  cfl=0.18 reproduces the validated dx=3mm regime in
-        mpm_kidney_resection.
+        sqrt((lam + 2 mu) / rho).  This is the fastest signal an explicit
+        scheme has to resolve, so it -- not sqrt(E/rho) -- sets the CFL bound.
+
+        The difference is not academic for soft tissue.  At nu = 0.48 the
+        P-wave speed is ~3x the rod speed, because lam blows up as nu -> 0.5:
+
+            nu = 0.30   ratio 1.16
+            nu = 0.45   ratio 2.11
+            nu = 0.48   ratio 2.96
+            nu = 0.49   ratio 4.15
+
+        Sizing dt from sqrt(E/rho) at nu = 0.48 therefore runs at roughly 3x
+        the intended Courant number, which shows up as slow energy growth
+        rather than an immediate blow-up -- tissue that keeps creeping and
+        never settles.
         """
-        return float(min(dt_max, cfl * self.dx / self.wave_speed))
+        if self.mu_p is None or self.lam_p is None:
+            mu, lam = self.material.mu, self.material.lam
+        else:
+            mu = float(self.mu_p.numpy().max())
+            lam = float(self.lam_p.numpy().max())
+        return float(np.sqrt((lam + 2.0 * mu) / self.material.rho))
+
+    def courant(self, dt=None):
+        """Courant number c_p * dt / dx for the current (or a proposed) dt."""
+        dt = float(self.dt if dt is None else dt)
+        return float(self.p_wave_speed * dt / self.dx)
+
+    def cfl_dt(self, cfl: float = 0.18, dt_max: float = 2.0e-4) -> float:
+        """CFL-limited timestep, min(dt_max, cfl * dx / c_p).
+
+        Uses the dilatational speed of the stiffest particle, so a
+        heterogeneous, nearly-incompressible model is stable everywhere.
+        """
+        return float(min(dt_max, cfl * self.dx / self.p_wave_speed))
 
     def _step_core(self, gravity, pre_p2g=(), post_g2p=(), post_forces=()):
         """The single MPM pipeline. Every step entry point goes through here.

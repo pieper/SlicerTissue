@@ -222,8 +222,33 @@ def test_E_max_and_cfl_follow_stiffest_particle():
     sim.set_particle_material(E=E, nu=NU)
 
     assert sim._E_max == pytest.approx(100.0 * E_NOM)
-    # c_s scales as sqrt(E), so dt must shrink by 10x
+    # c_p scales as sqrt(E) at fixed nu, so dt must shrink by 10x
     assert sim.cfl_dt(dt_max=1.0) == pytest.approx(dt_uniform / 10.0, rel=1e-6)
+
+
+def test_cfl_uses_dilatational_not_rod_speed():
+    """The CFL bound must use sqrt((lam+2mu)/rho), not sqrt(E/rho).
+
+    For nearly-incompressible tissue these differ by a lot -- 2.96x at
+    nu=0.48 -- because lam blows up as nu -> 0.5.  Sizing dt from the rod
+    speed silently runs at ~3x the intended Courant number, which shows up as
+    slow energy growth rather than an obvious blow-up: tissue that keeps
+    creeping and never settles.
+    """
+    sim = _build()
+    _clamp_and_stretch(sim)
+    sim.set_particle_material(E=19_000.0, nu=0.48)
+
+    rho = sim.material.rho
+    mu = 19_000.0 / (2 * 1.48)
+    lam = 19_000.0 * 0.48 / (1.48 * 0.04)
+    assert sim.p_wave_speed == pytest.approx(np.sqrt((lam + 2 * mu) / rho), rel=1e-4)
+    assert sim.p_wave_speed > 2.5 * sim.wave_speed, \
+        "p_wave_speed collapsed to the rod speed"
+
+    dt = sim.cfl_dt(cfl=0.18, dt_max=1.0)
+    assert sim.courant(dt) == pytest.approx(0.18, rel=1e-6), \
+        "cfl_dt did not actually deliver the requested Courant number"
 
 
 def test_mu_lam_conversion_roundtrip():
