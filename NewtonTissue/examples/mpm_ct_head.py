@@ -748,7 +748,12 @@ class MPMCTHead:
         self._finger_vel_m += (F_total / self._finger_mass) * dt
         self._finger_pos_m += self._finger_vel_m * dt
 
+        # hemi_dir must match this scene's axis convention.  The MPM lattice
+        # is mapped R->X, A->Y, S->Z, so gravity and the finger both act along
+        # -Z (inferior).  step_with_contact defaults to a (0,-1,0) gate -- the
+        # -A half -- which would engage the wrong half of the finger sphere.
         self.sim.step_with_contact(gravity, self._finger_pos_m, self._probe_radius,
+                                   hemi_dir=np.array([0.0, 0.0, -1.0]),
                                    sphere_vel=self._finger_vel_m,
                                    stiction=self._stiction)
 

@@ -153,6 +153,13 @@ def _recompute_F_total_lagrangian(
     """
     p = wp.tid()
 
+    # When BOTH axis neighbours are missing there is nothing to difference.
+    # Falling back to the identity column would assert "unstretched along this
+    # axis", which is wrong exactly where it matters most: on a fresh cut face,
+    # next to two genuinely stretched columns, it manufactures spurious shear.
+    # Keep whatever F already holds for that direction instead.
+    Fp = F[p]
+
     # --- Column 0: X material direction (i-axis) ---
     pp = nbr_px[p]
     pm = nbr_mx[p]
@@ -163,7 +170,7 @@ def _recompute_F_total_lagrangian(
     elif pm >= 0:
         col0 = (x[p] - x[pm]) * (1.0 / step)
     else:
-        col0 = wp.vec3(1.0, 0.0, 0.0)   # fallback: identity
+        col0 = wp.vec3(Fp[0, 0], Fp[1, 0], Fp[2, 0])  # keep current column
 
     # --- Column 1: Y material direction (j-axis) ---
     pp = nbr_py[p]
@@ -175,7 +182,7 @@ def _recompute_F_total_lagrangian(
     elif pm >= 0:
         col1 = (x[p] - x[pm]) * (1.0 / step)
     else:
-        col1 = wp.vec3(0.0, 1.0, 0.0)
+        col1 = wp.vec3(Fp[0, 1], Fp[1, 1], Fp[2, 1])  # keep current column
 
     # --- Column 2: Z material direction (k-axis) ---
     pp = nbr_pz[p]
@@ -187,7 +194,7 @@ def _recompute_F_total_lagrangian(
     elif pm >= 0:
         col2 = (x[p] - x[pm]) * (1.0 / step)
     else:
-        col2 = wp.vec3(0.0, 0.0, 1.0)
+        col2 = wp.vec3(Fp[0, 2], Fp[1, 2], Fp[2, 2])  # keep current column
 
     # Assemble F[i,j] = col_j[i]  (row-major Warp storage)
     F[p] = wp.mat33(col0[0], col1[0], col2[0],
@@ -358,18 +365,23 @@ def _grid_update(
     dt:      float,
     gravity: wp.vec3,
     damping: float,
+    floor_j0: int,
 ):
-    """Grid momentum update: divide by mass, add gravity, damp, apply BCs."""
+    """Grid momentum update: divide by mass, add gravity, damp, apply BCs.
+
+    floor_j0 enables the frictionless no-penetration floor at grid row j == 0.
+    It is on by default for backward compatibility, but scenarios that supply
+    their own support surface (SARRTS) should turn it off -- otherwise the
+    most-posterior grid plane silently acts as a second, invisible wall.
+    """
     flat = wp.tid()
     m = grid_m[flat]
     if m > 0.0:
         v = (grid_v[flat] / m + dt * gravity) * damping
 
-        i = flat // (n_grid * n_grid)
         j = (flat // n_grid) % n_grid
-        k = flat % n_grid
 
-        if j == 0 and v[1] < 0.0:
+        if floor_j0 != 0 and j == 0 and v[1] < 0.0:
             v = wp.vec3(v[0], 0.0, v[2])
 
         grid_v[flat] = v
@@ -394,20 +406,25 @@ def _apply_grid_fixed_bc(
 
 @wp.kernel
 def _apply_grid_sdf_bc(
-    grid_v:   wp.array(dtype=wp.vec3),
-    sdf:      wp.array(dtype=float),
-    sdf_grad: wp.array(dtype=wp.vec3),
-    dx:       float,
+    grid_v:      wp.array(dtype=wp.vec3),
+    sdf:         wp.array(dtype=float),
+    sdf_grad:    wp.array(dtype=wp.vec3),
+    dx:          float,
+    friction_mu: float,
 ):
-    """SDF-based grid boundary condition for bone.
+    """SDF-based grid boundary condition for a static obstacle.
 
-    - SDF < 0 (inside bone): zero velocity — hard wall.
-    - 0 ≤ SDF < dx (near surface): remove the inward velocity component
-      so tissue can slide along bone but not penetrate.
+    - SDF < 0 (inside the obstacle): zero velocity — hard wall.
+    - 0 ≤ SDF < dx (near surface): remove the inward velocity component so
+      tissue can slide along the surface but not penetrate.
     - SDF ≥ dx: free.
 
-    Applied after grid_update and before G2P to prevent the grid velocity
-    field from ever pushing tissue into bone.
+    friction_mu applies Coulomb friction to the sliding component: the
+    tangential velocity is reduced by at most mu * |v_n|, never reversed.
+    friction_mu = 0 reproduces frictionless sliding.
+
+    Applied after grid_update and before G2P so the grid velocity field can
+    never push tissue into the obstacle.
     """
     flat = wp.tid()
     d = sdf[flat]
@@ -421,7 +438,14 @@ def _apply_grid_sdf_bc(
             v = grid_v[flat]
             v_n = wp.dot(v, normal)
             if v_n < 0.0:
-                grid_v[flat] = v - v_n * normal
+                v_t = v - v_n * normal
+                if friction_mu > 0.0:
+                    t_len = wp.length(v_t)
+                    if t_len > 1.0e-8:
+                        # Coulomb: drop at most mu*|v_n| of tangential speed
+                        scale = wp.max(0.0, 1.0 - friction_mu * wp.abs(v_n) / t_len)
+                        v_t = v_t * scale
+                grid_v[flat] = v_t
 
 
 @wp.kernel
@@ -433,8 +457,9 @@ def _apply_bone_sdf_contact(
     sdf_grad: wp.array(dtype=wp.vec3),   # precomputed SDF gradient per grid node
     n_grid:   int,
     inv_dx:   float,
+    friction_mu: float,
 ):
-    """Project tissue particles out of bone using a signed distance field.
+    """Project tissue particles out of an obstacle using a signed distance field.
 
     For each free particle inside bone (SDF < 0), the particle is pushed to
     the bone surface along the precomputed SDF gradient.  The inward velocity
@@ -615,6 +640,88 @@ def _g2p_cut(
 
 
 @wp.kernel
+def _g2p_cut_no_F_update(
+    x:       wp.array(dtype=wp.vec3),
+    v:       wp.array(dtype=wp.vec3),
+    C:       wp.array(dtype=wp.mat33),
+    fixed:   wp.array(dtype=int),
+    grid_v:  wp.array(dtype=wp.vec3),
+    cut_sdf: wp.array(dtype=float),
+    n_grid:  int,
+    inv_dx:  float,
+    dt:      float,
+):
+    """Cut-aware G2P that does NOT update F — for total-Lagrangian mode.
+
+    Without this kernel, total_lagrangian=True silently loses cut awareness on
+    the gather side: step() would pick _g2p_no_F_update, so momentum was
+    blocked across the cut during P2G but not during G2P.  That asymmetry made
+    "fix TL to get true spring-back" impossible.  F is recomputed from
+    positions by _recompute_F_total_lagrangian each step, so it must not also
+    be integrated here.
+    """
+    p = wp.tid()
+    xp = x[p]
+    dx = 1.0 / inv_dx
+
+    # Particle's SDF side
+    pi = wp.clamp(int(wp.round(xp[0] * inv_dx)), 0, n_grid - 1)
+    pj = wp.clamp(int(wp.round(xp[1] * inv_dx)), 0, n_grid - 1)
+    pk = wp.clamp(int(wp.round(xp[2] * inv_dx)), 0, n_grid - 1)
+    p_sdf = cut_sdf[pi * n_grid * n_grid + pj * n_grid + pk]
+
+    bx = int(wp.floor(xp[0] * inv_dx - 0.5))
+    by = int(wp.floor(xp[1] * inv_dx - 0.5))
+    bz = int(wp.floor(xp[2] * inv_dx - 0.5))
+
+    fx_x = xp[0] * inv_dx - float(bx)
+    fx_y = xp[1] * inv_dx - float(by)
+    fx_z = xp[2] * inv_dx - float(bz)
+
+    new_v = wp.vec3(0.0, 0.0, 0.0)
+    new_C = wp.mat33(0.0, 0.0, 0.0,
+                     0.0, 0.0, 0.0,
+                     0.0, 0.0, 0.0)
+
+    for di in range(3):
+        wx = _bspline_w(fx_x, di)
+        gi = bx + di
+        if gi < 0 or gi >= n_grid:
+            continue
+        for dj in range(3):
+            wy = _bspline_w(fx_y, dj)
+            gj = by + dj
+            if gj < 0 or gj >= n_grid:
+                continue
+            for dk in range(3):
+                wz = _bspline_w(fx_z, dk)
+                gk = bz + dk
+                if gk < 0 or gk >= n_grid:
+                    continue
+                flat = gi * n_grid * n_grid + gj * n_grid + gk
+                g_sdf = cut_sdf[flat]
+                if p_sdf * g_sdf < 0.0:
+                    continue
+                w    = wx * wy * wz
+                vi   = grid_v[flat]
+                xi   = wp.vec3(float(gi) * dx, float(gj) * dx, float(gk) * dx)
+                dpos = xi - xp
+                new_v = new_v + w * vi
+                new_C = new_C + (4.0 * inv_dx * inv_dx * w) * wp.outer(vi, dpos)
+
+    # No weight renormalization — following CRESSim-MPM (Ou & Tavakoli 2025).
+    # Particles near the cut receive less total weight because some nodes
+    # are blocked.  This correctly reduces their velocity rather than
+    # amplifying from the surviving nodes.
+
+    C[p] = new_C
+
+    if fixed[p] == 0:
+        v[p] = new_v
+        x[p] = xp + dt * new_v
+
+
+@wp.kernel
 def _break_bonds_across_cut(
     x:            wp.array(dtype=wp.vec3),
     fib_i:        wp.array(dtype=int),
@@ -751,6 +858,7 @@ def _grid_rigid_sphere_bc(
     sphere_radius: float,
     push_rate: float,   # outward velocity per metre of penetration [1/s]
     max_dv:   float,    # CFL cap on outward velocity correction [m/s]
+    hemi_dir: wp.vec3,  # gate direction; (0,-1,0) = lower half, 0 = full sphere
 ):
     """Grid-level rigid sphere boundary condition (lower hemisphere only).
 
@@ -773,7 +881,8 @@ def _grid_rigid_sphere_bc(
 
     delta = xi - sphere_center
     dist = wp.length(delta)
-    if dist < sphere_radius and dist > 1.0e-12 and delta[1] < 0.0:
+    gated = wp.length(hemi_dir) < 1.0e-9 or wp.dot(delta, hemi_dir) > 0.0
+    if dist < sphere_radius and dist > 1.0e-12 and gated:
         penetration = sphere_radius - dist
         normal = delta / dist
         v = grid_v[flat]
@@ -800,6 +909,7 @@ def _apply_hemisphere_contact(
     sphere_vel: wp.vec3,     # rigid-body translational velocity [m/s]
     stiction:   float,       # tangential velocity-match fraction per kick (0..1)
     contact_impulse: wp.array(dtype=wp.vec3),
+    hemi_dir: wp.vec3,       # gate direction; (0,-1,0) = lower half, 0 = full sphere
 ):
     """Lower-hemisphere rigid contact — applied BEFORE P2G.
 
@@ -823,7 +933,8 @@ def _apply_hemisphere_contact(
         return
     delta = x[p] - sphere_center
     dist = wp.length(delta)
-    if dist < sphere_radius and dist > 1.0e-12 and delta[1] < 0.0:
+    gated = wp.length(hemi_dir) < 1.0e-9 or wp.dot(delta, hemi_dir) > 0.0
+    if dist < sphere_radius and dist > 1.0e-12 and gated:
         penetration = sphere_radius - dist
         normal = delta / dist
 
@@ -853,6 +964,7 @@ def _project_particles_from_sphere(
     fixed:  wp.array(dtype=int),
     sphere_center: wp.vec3,
     sphere_radius: float,
+    hemi_dir: wp.vec3,  # gate direction; (0,-1,0) = lower half, 0 = full sphere
 ):
     """Project any free particle inside the rigid sphere to its surface.
 
@@ -871,7 +983,8 @@ def _project_particles_from_sphere(
     delta = x[p] - sphere_center
     dist = wp.length(delta)
     # Lower hemisphere only (consistent with grid BC)
-    if dist < sphere_radius and dist > 1.0e-12 and delta[1] < 0.0:
+    gated = wp.length(hemi_dir) < 1.0e-9 or wp.dot(delta, hemi_dir) > 0.0
+    if dist < sphere_radius and dist > 1.0e-12 and gated:
         normal = delta / dist
         x[p] = sphere_center + sphere_radius * normal
         v_n = wp.dot(v[p], normal)
@@ -1078,11 +1191,25 @@ class MPMSimulator:
         # velocity at those grid nodes every step.
         self.grid_bc_fixed = None
 
-        # Optional bone SDF contact (particle-level, after G2P).
-        # Set bone_sdf (float per grid node, neg=inside bone) and
-        # bone_sdf_grad (vec3 per grid node, outward normal) to enable.
-        self.bone_sdf      = None
-        self.bone_sdf_grad = None
+        # Optional static-obstacle SDF (grid BC + particle projection).
+        # Set obstacle_sdf (float per grid node, neg = inside the obstacle) and
+        # obstacle_sdf_grad (vec3 per grid node, outward normal) to enable.
+        # Historically named bone_sdf; it is a generic obstacle -- skull,
+        # psoas, body wall, a synthetic support half-space -- so the neutral
+        # name is primary and bone_sdf remains as an alias property.
+        self.obstacle_sdf      = None
+        self.obstacle_sdf_grad = None
+
+        #: Coulomb friction coefficient for the obstacle surface.  0 = the
+        #: historical frictionless sliding.  Retroperitoneal fat is slippery
+        #: but not frictionless: ~0.15.
+        self.obstacle_friction = 0.0
+
+        #: Frictionless no-penetration floor at grid row j == 0.  On by
+        #: default for backward compatibility.  Turn it off in scenarios that
+        #: supply their own support surface, or the most-posterior grid plane
+        #: acts as a second, invisible wall.
+        self.floor_j0 = True
 
         # Per-particle Lamé parameters.  Allocated lazily from self.material by
         # _ensure_material_arrays(), which every step entry point calls, so
@@ -1362,8 +1489,27 @@ class MPMSimulator:
         """
         return float(min(dt_max, cfl * self.dx / self.wave_speed))
 
-    def step(self, gravity=None):
-        """Advance one explicit timestep."""
+    def _step_core(self, gravity, pre_p2g=(), post_g2p=(), post_forces=()):
+        """The single MPM pipeline. Every step entry point goes through here.
+
+        step(), step_with_contact() and step_with_probe() used to be near-
+        duplicate copies of this sequence, and that duplication was a bug, not
+        just repetition: step_with_contact's copy always launched the plain
+        _p2g/_g2p, so an active cut silently stopped blocking momentum during
+        palpation.  Defining the pipeline once fixes that by construction.
+
+        The hooks are sequences of zero-arg callables that launch their own
+        kernels at documented points, all inside the ScopedDevice:
+
+        pre_p2g     before the grid is zeroed, so the effect is scattered to
+                    the grid and captured by the APIC C matrix (and hence F).
+                    Sustained loads -- contact, tethers, suction -- belong
+                    here; applied only after G2P they are invisible to that
+                    step's stress update, which is what drives F drift.
+        post_g2p    immediately after G2P, for the geometric half of a
+                    dual-kick contact.
+        post_forces after the fiber and curvature forces.
+        """
         if gravity is None:
             gravity = np.array([0.0, -9.8, 0.0])
         self._ensure_material_arrays()
@@ -1371,10 +1517,14 @@ class MPMSimulator:
         n   = self.n_particles
         dt  = float(self.dt)
         g   = wp.vec3(float(gravity[0]), float(gravity[1]), float(gravity[2]))
+        cut = self.cut_sdfs[-1] if self.cut_sdfs else None
 
         with wp.ScopedDevice(self.device):
-            # In total-Lagrangian mode, recompute F from current positions
-            # BEFORE P2G so the stress uses a drift-free deformation gradient.
+            for hook in pre_p2g:
+                hook()
+
+            # Total-Lagrangian: recompute F from current positions BEFORE P2G
+            # so the stress uses a drift-free deformation gradient.
             if self.total_lagrangian and self.nbr_px is not None:
                 wp.launch(_recompute_F_total_lagrangian, dim=n,
                           inputs=[self.x, self.F,
@@ -1383,46 +1533,51 @@ class MPMSimulator:
                                   self.nbr_pz, self.nbr_mz,
                                   float(self._lattice_step)])
 
-            wp.launch(_zero_grid, dim=ng**3,
-                      inputs=[self.grid_v, self.grid_m])
+            wp.launch(_zero_grid, dim=ng**3, inputs=[self.grid_v, self.grid_m])
 
-            # P2G: use cut-aware version if any cut is active.
-            # Uses the most recent cut SDF (multiple cuts are accumulated
-            # by merging into a single composite SDF via apply_cut).
-            if self.cut_sdfs:
+            # P2G — cut-aware when a cut is active.  Only the most recent cut
+            # SDF is used; multiple cuts must be merged into one composite
+            # field by the caller (see apply_cut(replace=True)).
+            if cut is not None:
                 wp.launch(_p2g_cut, dim=n,
                           inputs=[self.x, self.v, self.F, self.C,
-                                   self.m_p, self.vol_p,
-                                   self.grid_v, self.grid_m,
-                                   self.cut_sdfs[-1],
-                                   self.mu_p, self.lam_p,
-                                   ng, float(self.inv_dx), dt])
+                                  self.m_p, self.vol_p,
+                                  self.grid_v, self.grid_m, cut,
+                                  self.mu_p, self.lam_p,
+                                  ng, float(self.inv_dx), dt])
             else:
                 wp.launch(_p2g, dim=n,
                           inputs=[self.x, self.v, self.F, self.C,
-                                   self.m_p, self.vol_p,
-                                   self.grid_v, self.grid_m,
-                                   self.mu_p, self.lam_p,
-                                   ng, float(self.inv_dx), dt])
+                                  self.m_p, self.vol_p,
+                                  self.grid_v, self.grid_m,
+                                  self.mu_p, self.lam_p,
+                                  ng, float(self.inv_dx), dt])
 
             wp.launch(_grid_update, dim=ng**3,
                       inputs=[self.grid_v, self.grid_m, ng, dt, g,
-                               float(self.velocity_damping)])
+                              float(self.velocity_damping),
+                              int(bool(self.floor_j0))])
 
             if self.grid_bc_fixed is not None:
                 wp.launch(_apply_grid_fixed_bc, dim=ng**3,
                           inputs=[self.grid_v, self.grid_bc_fixed])
 
-            if self.bone_sdf is not None:
+            if self.obstacle_sdf is not None:
                 wp.launch(_apply_grid_sdf_bc, dim=ng**3,
-                          inputs=[self.grid_v, self.bone_sdf,
-                                  self.bone_sdf_grad, float(self.dx)])
+                          inputs=[self.grid_v, self.obstacle_sdf,
+                                  self.obstacle_sdf_grad, float(self.dx),
+                                  float(self.obstacle_friction)])
 
-            # G2P: cut-aware version blocks gather across cut surfaces
-            if self.cut_sdfs and not self.total_lagrangian:
+            # G2P — a clean 2x2 over (cut active?, total-Lagrangian?)
+            if cut is not None and self.total_lagrangian:
+                wp.launch(_g2p_cut_no_F_update, dim=n,
+                          inputs=[self.x, self.v, self.C, self.fixed,
+                                  self.grid_v, cut,
+                                  ng, float(self.inv_dx), dt])
+            elif cut is not None:
                 wp.launch(_g2p_cut, dim=n,
                           inputs=[self.x, self.v, self.F, self.C, self.fixed,
-                                  self.grid_v, self.cut_sdfs[-1],
+                                  self.grid_v, cut,
                                   ng, float(self.inv_dx), dt])
             elif self.total_lagrangian:
                 wp.launch(_g2p_no_F_update, dim=n,
@@ -1433,11 +1588,15 @@ class MPMSimulator:
                           inputs=[self.x, self.v, self.F, self.C, self.fixed,
                                   self.grid_v, ng, float(self.inv_dx), dt])
 
-            if self.bone_sdf is not None:
+            for hook in post_g2p:
+                hook()
+
+            if self.obstacle_sdf is not None:
                 wp.launch(_apply_bone_sdf_contact, dim=n,
                           inputs=[self.x, self.v, self.fixed,
-                                  self.bone_sdf, self.bone_sdf_grad,
-                                  ng, float(self.inv_dx)])
+                                  self.obstacle_sdf, self.obstacle_sdf_grad,
+                                  ng, float(self.inv_dx),
+                                  float(self.obstacle_friction)])
 
             if self.n_bonds > 0:
                 wp.launch(_apply_fiber_forces, dim=self.n_bonds,
@@ -1461,6 +1620,13 @@ class MPMSimulator:
                               float(self.material.k_curve),
                               dt,
                           ])
+
+            for hook in post_forces:
+                hook()
+
+    def step(self, gravity=None):
+        """Advance one explicit timestep."""
+        self._step_core(gravity)
 
     def sample_equilibrium(self):
         """Snapshot current positions as the gravity-equilibrium reference.
@@ -1526,7 +1692,8 @@ class MPMSimulator:
     # ------------------------------------------------------------------
 
     def apply_cut(self, cut_sdf_np: np.ndarray,
-                  retract_mm: float = 5.0, retract_steps: int = 100):
+                  retract_mm: float = 5.0, retract_steps: int = 100,
+                  reset_reference: bool = True, replace: bool = False):
         """Register a cut surface and retract the edges apart.
 
         The SDF is sampled on the MPM grid (n_grid^3 flat array, float32).
@@ -1548,10 +1715,24 @@ class MPMSimulator:
             cut_sdf_np:   (n_grid^3,) float32 SDF on the MPM grid.
             retract_mm:   How far to retract each side [mm]. 0 = no retraction.
             retract_steps: Number of sim steps over which to apply retraction.
+            reset_reference: re-reference near-cut particles to their current
+                          (deformed) pose by setting F->I and x0->x.  Correct
+                          when cutting tissue that is at rest, but it FREEZES
+                          the freed edge in its deformed shape -- so pass
+                          False when the tissue is under load and you want it
+                          to spring back after severance.
+            replace:      replace the cut list with this SDF instead of
+                          appending.  Only cut_sdfs[-1] is used by the
+                          pipeline, so a caller compositing progressive cuts
+                          into one field should pass True to avoid growing an
+                          unused list.
         """
         with wp.ScopedDevice(self.device):
             cut_sdf = wp.array(cut_sdf_np.astype(np.float32), dtype=float)
-        self.cut_sdfs.append(cut_sdf)
+        if replace:
+            self.cut_sdfs = [cut_sdf]
+        else:
+            self.cut_sdfs.append(cut_sdf)
 
         # Break fiber bonds that cross the cut
         if self.n_bonds > 0 and self.fiber_broken is not None:
@@ -1585,7 +1766,7 @@ class MPMSimulator:
         near_cut = (np.abs(p_sdf) > 0) & (np.abs(p_sdf) < 3.0 * float(self.dx))
         near_cut = near_cut & (fixed == 0)
         n_reset = int(near_cut.sum())
-        if n_reset > 0:
+        if n_reset > 0 and reset_reference:
             F_np[near_cut] = np.eye(3, dtype=np.float32)
             x0_np[near_cut] = pos[near_cut]
             with wp.ScopedDevice(self.device):
@@ -1741,7 +1922,6 @@ class MPMSimulator:
                                downward press on top face)
             probe_radius:      spatial falloff radius [m]
         """
-        self.step(gravity)
         rho   = float(self.material.rho)
         # Dimensionally correct: contact pressure P over area πR² distributed
         # into sphere volume (4/3)πR³ → body accel = P × 3/(4ρR) [m/s²]
@@ -1749,10 +1929,16 @@ class MPMSimulator:
         accel = np.asarray(probe_normal, dtype=np.float64) * (probe_pressure_pa * area_vol_ratio / rho)
         c  = wp.vec3(float(probe_center[0]), float(probe_center[1]), float(probe_center[2]))
         a  = wp.vec3(float(accel[0]),        float(accel[1]),        float(accel[2]))
-        with wp.ScopedDevice(self.device):
+        # _step_core runs the hooks inside its own ScopedDevice.
+        def probe_kick():
             wp.launch(_apply_probe_force, dim=self.n_particles,
                       inputs=[self.x, self.v, self.fixed,
-                               c, a, float(probe_radius), float(self.dt)])
+                              c, a, float(probe_radius), float(self.dt)])
+
+        # post_forces preserves the historical ordering (the probe force used
+        # to be applied after a complete step).  A sustained load would be
+        # better placed in pre_p2g so the stress update sees it.
+        self._step_core(gravity, post_forces=[probe_kick])
 
     def step_with_contact(
         self,
@@ -1761,141 +1947,87 @@ class MPMSimulator:
         sphere_radius: float,
         sphere_vel: np.ndarray = None,
         stiction: float = 0.0,
+        hemi_dir: np.ndarray = None,
     ):
-        """Advance one timestep with rigid hemisphere contact.
+        """Advance one timestep with rigid sphere contact (dual kick).
 
-        The contact velocity kick is applied to particles BEFORE P2G so that
-        the modified velocities are scattered to the grid.  G2P then computes
-        C and F from grid velocities that include the contact effect — this
-        prevents the F-drift that occurs when contact bypasses the MPM pipeline.
+        The contact kick is applied twice: BEFORE P2G, so the modified
+        velocities scatter to the grid and G2P computes C and F from a
+        velocity field that includes the contact (this is what prevents
+        F-drift); and again after G2P, which supplies the actual geometric
+        push.
 
-        Only the lower hemisphere is enforced (finger pressing from above).
+        Because this now runs through _step_core, an active cut is respected
+        here too.  It previously was not: this method carried its own copy of
+        the pipeline that always launched the plain _p2g/_g2p.
 
         Args:
-            gravity:        gravity vector [m/s²]
-            sphere_center:  3-vector, centre of rigid probe sphere [m]
-            sphere_radius:  probe sphere radius [m] (finger tip ≈ 0.008–0.012 m)
+            gravity:        gravity vector [m/s^2]
+            sphere_center:  3-vector, centre of the rigid probe sphere [m]
+            sphere_radius:  probe sphere radius [m] (finger tip ~0.008-0.012 m)
             sphere_vel:     optional 3-vector, sphere translational velocity
                             [m/s].  Used by the stiction term; ignored if
                             stiction == 0.  Defaults to zero.
             stiction:       tangential velocity-match fraction per kick (0..1).
                             0 = frictionless (default), 1 = full no-slip lock
-                            in one substep.  ~0.3 gives a noticeable grip with
-                            mild reaction force back on the sphere.
+                            in one substep.  ~0.3 gives a noticeable grip.
+            hemi_dir:       which half of the sphere makes contact.  Defaults
+                            to (0, -1, 0), the historical lower-hemisphere
+                            behaviour of a finger pressing from above.  Pass
+                            a zero vector for a full sphere -- correct for a
+                            laparoscopic tip, which contacts from any side
+                            once embedded.  NOTE the default is an axis-1 gate
+                            regardless of the scenario's gravity direction, so
+                            a tool pressing along another axis must pass this.
         """
-        if gravity is None:
-            gravity = np.array([0.0, -9.8, 0.0])
         if sphere_vel is None:
             sphere_vel = np.zeros(3)
+        if hemi_dir is None:
+            hemi_dir = np.array([0.0, -1.0, 0.0])
+
         self._ensure_material_arrays()
-        ng  = self.n_grid
-        n   = self.n_particles
-        dt  = float(self.dt)
+        dt = float(self.dt)
+        n = self.n_particles
 
-        g   = wp.vec3(float(gravity[0]), float(gravity[1]), float(gravity[2]))
-
-        # Use the STIFFEST particle: with a heterogeneous model the probe must
-        # respond at the fastest local wave speed or it under-pushes the stiff
-        # regions.
-        c_s = self.wave_speed
-        response_rate = c_s / float(sphere_radius)
-        sc = wp.vec3(float(sphere_center[0]), float(sphere_center[1]),
-                      float(sphere_center[2]))
-        sv = wp.vec3(float(sphere_vel[0]), float(sphere_vel[1]),
-                     float(sphere_vel[2]))
+        # Stiffest particle: with heterogeneous tissue the probe must respond
+        # at the fastest local wave speed or it under-pushes stiff regions.
+        response_rate = self.wave_speed / float(sphere_radius)
+        sc = wp.vec3(*[float(c) for c in sphere_center])
+        sv = wp.vec3(*[float(c) for c in sphere_vel])
+        hd = wp.vec3(*[float(c) for c in hemi_dir])
         st = float(stiction)
+
+        def kick():
+            wp.launch(_apply_hemisphere_contact, dim=n,
+                      inputs=[self.x, self.v, self.fixed, self.m_p,
+                              sc, float(sphere_radius),
+                              float(response_rate), dt, sv, st,
+                              self._contact_impulse_buf, hd])
 
         with wp.ScopedDevice(self.device):
             self._contact_impulse_buf.zero_()
 
-            if self.total_lagrangian and self.nbr_px is not None:
-                wp.launch(_recompute_F_total_lagrangian, dim=n,
-                          inputs=[self.x, self.F,
-                                  self.nbr_px, self.nbr_mx,
-                                  self.nbr_py, self.nbr_my,
-                                  self.nbr_pz, self.nbr_mz,
-                                  float(self._lattice_step)])
+        self._step_core(gravity, pre_p2g=[kick], post_g2p=[kick])
 
-            # Contact velocity kick BEFORE P2G — gets scattered to grid
-            # so that G2P correctly captures the contact in C and F.
-            wp.launch(_apply_hemisphere_contact, dim=n,
-                      inputs=[self.x, self.v, self.fixed, self.m_p,
-                              sc, float(sphere_radius),
-                              float(response_rate), dt,
-                              sv, st,
-                              self._contact_impulse_buf])
+        self._last_contact_impulse_np = self._contact_impulse_buf.numpy()[0].copy()
 
-            wp.launch(_zero_grid, dim=ng**3,
-                      inputs=[self.grid_v, self.grid_m])
+    @property
+    def bone_sdf(self):
+        """Deprecated alias for obstacle_sdf (kept for mpm_ct_head)."""
+        return self.obstacle_sdf
 
-            wp.launch(_p2g, dim=n,
-                      inputs=[self.x, self.v, self.F, self.C,
-                               self.m_p, self.vol_p,
-                               self.grid_v, self.grid_m,
-                               self.mu_p, self.lam_p,
-                               ng, float(self.inv_dx), dt])
+    @bone_sdf.setter
+    def bone_sdf(self, value):
+        self.obstacle_sdf = value
 
-            wp.launch(_grid_update, dim=ng**3,
-                      inputs=[self.grid_v, self.grid_m, ng, dt, g,
-                               float(self.velocity_damping)])
+    @property
+    def bone_sdf_grad(self):
+        """Deprecated alias for obstacle_sdf_grad."""
+        return self.obstacle_sdf_grad
 
-            if self.grid_bc_fixed is not None:
-                wp.launch(_apply_grid_fixed_bc, dim=ng**3,
-                          inputs=[self.grid_v, self.grid_bc_fixed])
-
-            if self.bone_sdf is not None:
-                wp.launch(_apply_grid_sdf_bc, dim=ng**3,
-                          inputs=[self.grid_v, self.bone_sdf,
-                                  self.bone_sdf_grad, float(self.dx)])
-
-            if self.total_lagrangian:
-                wp.launch(_g2p_no_F_update, dim=n,
-                          inputs=[self.x, self.v, self.C, self.fixed,
-                                  self.grid_v, ng, float(self.inv_dx), dt])
-            else:
-                wp.launch(_g2p, dim=n,
-                          inputs=[self.x, self.v, self.F, self.C, self.fixed,
-                                  self.grid_v, ng, float(self.inv_dx), dt])
-
-            # Second contact kick after G2P — provides actual deformation.
-            wp.launch(_apply_hemisphere_contact, dim=n,
-                      inputs=[self.x, self.v, self.fixed, self.m_p,
-                              sc, float(sphere_radius),
-                              float(response_rate), dt,
-                              sv, st,
-                              self._contact_impulse_buf])
-
-            if self.bone_sdf is not None:
-                wp.launch(_apply_bone_sdf_contact, dim=n,
-                          inputs=[self.x, self.v, self.fixed,
-                                  self.bone_sdf, self.bone_sdf_grad,
-                                  ng, float(self.inv_dx)])
-
-            if self.n_bonds > 0:
-                wp.launch(_apply_fiber_forces, dim=self.n_bonds,
-                          inputs=[
-                              self.x, self.v, self.fixed, self.m_p,
-                              self.fiber_i, self.fiber_j, self.fiber_l0, self.fiber_t,
-                              self.fiber_broken, self.fiber_k,
-                              float(self.material.k_elastin),
-                              float(self.material.k_collagen),
-                              float(self.material.collagen_crimp),
-                              dt,
-                          ])
-
-            if self.material.k_curve > 0.0 and self.nbr_px is not None:
-                wp.launch(_apply_curvature_forces, dim=n,
-                          inputs=[
-                              self.x, self.v, self.fixed, self.m_p,
-                              self.nbr_px, self.nbr_mx,
-                              self.nbr_py, self.nbr_my,
-                              self.nbr_pz, self.nbr_mz,
-                              float(self.material.k_curve),
-                              dt,
-                          ])
-
-            self._last_contact_impulse_np = (
-                self._contact_impulse_buf.numpy()[0].astype(np.float32))
+    @bone_sdf_grad.setter
+    def bone_sdf_grad(self, value):
+        self.obstacle_sdf_grad = value
 
     @property
     def last_contact_impulse(self):
