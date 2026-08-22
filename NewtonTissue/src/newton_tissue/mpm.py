@@ -205,14 +205,16 @@ def _p2g(
     vol_p:  wp.array(dtype=float),
     grid_v: wp.array(dtype=wp.vec3),
     grid_m: wp.array(dtype=float),
+    mu_p:   wp.array(dtype=float),
+    lam_p:  wp.array(dtype=float),
     n_grid: int,
     inv_dx: float,
     dt:     float,
-    mu:     float,
-    lam:    float,
 ):
     """Particle → Grid transfer (one thread per particle)."""
     p = wp.tid()
+    mu  = mu_p[p]
+    lam = lam_p[p]
     xp = x[p]
     mp = m_p[p]
     Vp = vol_p[p]
@@ -272,11 +274,11 @@ def _p2g_cut(
     grid_v:  wp.array(dtype=wp.vec3),
     grid_m:  wp.array(dtype=float),
     cut_sdf: wp.array(dtype=float),   # signed distance per grid node
+    mu_p:    wp.array(dtype=float),
+    lam_p:   wp.array(dtype=float),
     n_grid:  int,
     inv_dx:  float,
     dt:      float,
-    mu:      float,
-    lam:     float,
 ):
     """P2G with cut-aware transfer: skip scatter across a cut surface.
 
@@ -285,6 +287,8 @@ def _p2g_cut(
     discontinuity at the cut, allowing tissue on opposite sides to separate.
     """
     p = wp.tid()
+    mu  = mu_p[p]
+    lam = lam_p[p]
     xp = x[p]
     mp = m_p[p]
     Vp = vol_p[p]
@@ -886,6 +890,7 @@ def _apply_fiber_forces(
     fib_l0: wp.array(dtype=float),
     fib_t:  wp.array(dtype=int),    # 0 = elastin, 1 = collagen
     fiber_broken: wp.array(dtype=int),   # 0 = intact, nonzero = broken
+    fiber_k: wp.array(dtype=float),      # per-bond stiffness multiplier
     k_e:    float,
     k_c:    float,
     crimp:  float,
@@ -896,6 +901,11 @@ def _apply_fiber_forces(
     Elastin: bidirectional linear spring.
     Collagen: tension-only, activates above crimp strain threshold.
     Broken bonds (fiber_broken != 0) are skipped.
+
+    fiber_k scales both bond types per bond (1.0 = nominal).  This is how thin
+    fibrous shells -- a renal capsule, a tumour pseudocapsule -- are modelled:
+    at 1-2 mm particle spacing a shell is a few bonds thick, which bonds
+    represent well and a bulk modulus does not.
     """
     b = wp.tid()
     if fiber_broken[b] != 0:
@@ -921,13 +931,14 @@ def _apply_fiber_forces(
 
     ftype = fib_t[b]
     force_mag = float(0.0)
+    fk = fiber_k[b]
 
     if ftype == 0:
-        force_mag = k_e * (l - l0)
+        force_mag = fk * k_e * (l - l0)
     else:
         eff = strain - crimp
         if eff > 0.0:
-            force_mag = k_c * eff * l0
+            force_mag = fk * k_c * eff * l0
 
     if force_mag == float(0.0):
         return
@@ -1073,10 +1084,21 @@ class MPMSimulator:
         self.bone_sdf      = None
         self.bone_sdf_grad = None
 
+        # Per-particle Lamé parameters.  Allocated lazily from self.material by
+        # _ensure_material_arrays(), which every step entry point calls, so
+        # callers that populate self.x / self.m_p by hand (mpm_ct_head,
+        # mpm_kidney_resection) keep working unchanged.  Use
+        # set_particle_material() for heterogeneous tissue.
+        self.mu_p  = None   # wp.array(dtype=float), shear modulus [Pa]
+        self.lam_p = None   # wp.array(dtype=float), first Lamé parameter [Pa]
+        self._E_max = float(material.E)   # stiffest particle; drives CFL and
+                                          # the contact response rate
+
         # Fiber bond arrays
         self.fiber_i  = None;  self.fiber_j  = None
         self.fiber_l0 = None;  self.fiber_t  = None
         self.fiber_broken = None  # wp.array(dtype=int), 0=intact, 1=broken
+        self.fiber_k = None       # wp.array(dtype=float), per-bond stiffness scale
         self.n_bonds  = 0
 
         # Cut SDFs: list of wp.array(dtype=float) of length n_grid^3.
@@ -1242,15 +1264,112 @@ class MPMSimulator:
             self.fiber_broken = wp.zeros(len(all_i), dtype=int)
         self.n_bonds = len(all_i)
 
+        # Particle/bond counts just changed: drop any per-particle material so
+        # _ensure_material_arrays() rebuilds it uniformly from self.material.
+        # Call set_particle_material() AFTER this to make tissue heterogeneous.
+        self.mu_p = None
+        self.lam_p = None
+        self.fiber_k = None
+        self._E_max = float(self.material.E)
+
+    # ------------------------------------------------------------------
+    # Per-particle material
+    # ------------------------------------------------------------------
+
+    def _ensure_material_arrays(self):
+        """Allocate mu_p / lam_p / fiber_k if absent or stale.
+
+        Called at the top of every step entry point.  Examples that build the
+        particle arrays by hand (rather than via initialize_block_particles)
+        therefore need no changes: they get uniform arrays broadcast from
+        self.material on the first step.
+        """
+        n = self.n_particles
+        if n and (self.mu_p is None or len(self.mu_p) != n):
+            with wp.ScopedDevice(self.device):
+                self.mu_p = wp.array(
+                    np.full(n, self.material.mu, dtype=np.float32), dtype=float)
+                self.lam_p = wp.array(
+                    np.full(n, self.material.lam, dtype=np.float32), dtype=float)
+            self._E_max = float(self.material.E)
+        if self.n_bonds and (self.fiber_k is None or len(self.fiber_k) != self.n_bonds):
+            with wp.ScopedDevice(self.device):
+                self.fiber_k = wp.array(
+                    np.ones(self.n_bonds, dtype=np.float32), dtype=float)
+
+    def set_particle_material(self, mu=None, lam=None, E=None, nu=None):
+        """Set per-particle Lamé parameters.
+
+        Accepts scalars (broadcast) or (n,) arrays.  Either give (mu, lam)
+        directly or (E, nu) to be converted.  Updates _E_max, which drives
+        cfl_dt() and the contact response rate -- so call this BEFORE choosing
+        the timestep.
+
+        Example, a tumour softer than the surrounding parenchyma::
+
+            E = np.where(is_tumor, 13_000.0, 19_000.0)
+            sim.set_particle_material(E=E, nu=0.48)
+            sim.dt = sim.cfl_dt()
+        """
+        n = self.n_particles
+        if not n:
+            raise RuntimeError("no particles yet; populate the simulator first")
+
+        if E is not None:
+            E = np.broadcast_to(np.asarray(E, dtype=np.float64), (n,))
+            nu = self.material.nu if nu is None else nu
+            nu = np.broadcast_to(np.asarray(nu, dtype=np.float64), (n,))
+            mu = E / (2.0 * (1.0 + nu))
+            lam = E * nu / ((1.0 + nu) * (1.0 - 2.0 * nu))
+        else:
+            if mu is None or lam is None:
+                raise ValueError("give either (E, nu) or both mu and lam")
+            mu = np.broadcast_to(np.asarray(mu, dtype=np.float64), (n,))
+            lam = np.broadcast_to(np.asarray(lam, dtype=np.float64), (n,))
+            # E = mu(3 lam + 2 mu) / (lam + mu), for the CFL bound
+            E = mu * (3.0 * lam + 2.0 * mu) / np.maximum(lam + mu, 1e-12)
+
+        with wp.ScopedDevice(self.device):
+            self.mu_p = wp.array(np.ascontiguousarray(mu, dtype=np.float32), dtype=float)
+            self.lam_p = wp.array(np.ascontiguousarray(lam, dtype=np.float32), dtype=float)
+        self._E_max = float(np.max(E))
+
+    def set_bond_stiffness(self, scale):
+        """Set the per-bond stiffness multiplier (scalar or (n_bonds,) array).
+
+        Used for fibrous shells such as the renal capsule and the tumour
+        pseudocapsule, which are thin enough that bonds -- not bulk moduli --
+        are the right representation at 1-2 mm particle spacing.
+        """
+        if not self.n_bonds:
+            raise RuntimeError("no bonds; build the fiber network first")
+        scale = np.broadcast_to(np.asarray(scale, dtype=np.float32), (self.n_bonds,))
+        with wp.ScopedDevice(self.device):
+            self.fiber_k = wp.array(np.ascontiguousarray(scale, dtype=np.float32),
+                                    dtype=float)
+
+    @property
+    def wave_speed(self):
+        """Elastic wave speed of the STIFFEST particle, sqrt(E_max/rho) [m/s]."""
+        return float(np.sqrt(self._E_max / self.material.rho))
+
+    def cfl_dt(self, cfl: float = 0.18, dt_max: float = 2.0e-4) -> float:
+        """CFL-limited timestep, min(dt_max, cfl * dx / c_s).
+
+        c_s comes from the stiffest particle, so a heterogeneous model is
+        stable everywhere.  cfl=0.18 reproduces the validated dx=3mm regime in
+        mpm_kidney_resection.
+        """
+        return float(min(dt_max, cfl * self.dx / self.wave_speed))
+
     def step(self, gravity=None):
         """Advance one explicit timestep."""
         if gravity is None:
             gravity = np.array([0.0, -9.8, 0.0])
+        self._ensure_material_arrays()
         ng  = self.n_grid
         n   = self.n_particles
         dt  = float(self.dt)
-        mu  = float(self.material.mu)
-        lam = float(self.material.lam)
         g   = wp.vec3(float(gravity[0]), float(gravity[1]), float(gravity[2]))
 
         with wp.ScopedDevice(self.device):
@@ -1276,13 +1395,15 @@ class MPMSimulator:
                                    self.m_p, self.vol_p,
                                    self.grid_v, self.grid_m,
                                    self.cut_sdfs[-1],
-                                   ng, float(self.inv_dx), dt, mu, lam])
+                                   self.mu_p, self.lam_p,
+                                   ng, float(self.inv_dx), dt])
             else:
                 wp.launch(_p2g, dim=n,
                           inputs=[self.x, self.v, self.F, self.C,
                                    self.m_p, self.vol_p,
                                    self.grid_v, self.grid_m,
-                                   ng, float(self.inv_dx), dt, mu, lam])
+                                   self.mu_p, self.lam_p,
+                                   ng, float(self.inv_dx), dt])
 
             wp.launch(_grid_update, dim=ng**3,
                       inputs=[self.grid_v, self.grid_m, ng, dt, g,
@@ -1323,7 +1444,7 @@ class MPMSimulator:
                           inputs=[
                               self.x, self.v, self.fixed, self.m_p,
                               self.fiber_i, self.fiber_j, self.fiber_l0, self.fiber_t,
-                              self.fiber_broken,
+                              self.fiber_broken, self.fiber_k,
                               float(self.material.k_elastin),
                               float(self.material.k_collagen),
                               float(self.material.collagen_crimp),
@@ -1666,14 +1787,17 @@ class MPMSimulator:
             gravity = np.array([0.0, -9.8, 0.0])
         if sphere_vel is None:
             sphere_vel = np.zeros(3)
+        self._ensure_material_arrays()
         ng  = self.n_grid
         n   = self.n_particles
         dt  = float(self.dt)
-        mu  = float(self.material.mu)
-        lam = float(self.material.lam)
+
         g   = wp.vec3(float(gravity[0]), float(gravity[1]), float(gravity[2]))
 
-        c_s = (float(self.material.E) / float(self.material.rho)) ** 0.5
+        # Use the STIFFEST particle: with a heterogeneous model the probe must
+        # respond at the fastest local wave speed or it under-pushes the stiff
+        # regions.
+        c_s = self.wave_speed
         response_rate = c_s / float(sphere_radius)
         sc = wp.vec3(float(sphere_center[0]), float(sphere_center[1]),
                       float(sphere_center[2]))
@@ -1708,7 +1832,8 @@ class MPMSimulator:
                       inputs=[self.x, self.v, self.F, self.C,
                                self.m_p, self.vol_p,
                                self.grid_v, self.grid_m,
-                               ng, float(self.inv_dx), dt, mu, lam])
+                               self.mu_p, self.lam_p,
+                               ng, float(self.inv_dx), dt])
 
             wp.launch(_grid_update, dim=ng**3,
                       inputs=[self.grid_v, self.grid_m, ng, dt, g,
@@ -1751,7 +1876,7 @@ class MPMSimulator:
                           inputs=[
                               self.x, self.v, self.fixed, self.m_p,
                               self.fiber_i, self.fiber_j, self.fiber_l0, self.fiber_t,
-                              self.fiber_broken,
+                              self.fiber_broken, self.fiber_k,
                               float(self.material.k_elastin),
                               float(self.material.k_collagen),
                               float(self.material.collagen_crimp),
