@@ -1127,6 +1127,215 @@ def _apply_curvature_forces(
 # Simulator class
 # ---------------------------------------------------------------------------
 
+@wp.kernel
+def _apply_attachment_forces(
+    x:         wp.array(dtype=wp.vec3),
+    v:         wp.array(dtype=wp.vec3),
+    fixed:     wp.array(dtype=int),
+    m_p:       wp.array(dtype=float),
+    att_p:     wp.array(dtype=int),      # particle index per attachment
+    att_ref:   wp.array(dtype=wp.vec3),  # attach point in FRAME coordinates [m]
+    att_k:     wp.array(dtype=float),    # stiffness [N/m]
+    att_c:     wp.array(dtype=float),    # damping   [N s/m]
+    att_state: wp.array(dtype=int),      # 1 = attached, 0 = released
+    frame_o:   wp.vec3,                  # frame origin, world [m]
+    frame_v:   wp.vec3,                  # frame velocity [m/s]
+    f_break:   float,                    # per-attachment release force [N]; <=0 = never
+    dt:        float,
+    reaction:  wp.array(dtype=wp.vec3),  # [0] accumulates the impulse on the frame
+):
+    """Damped springs tying particles to a moving rigid frame.
+
+    One kernel serves two things that look different but are not: the renal
+    pedicle tether is a set of particles sprung to a *static* frame (the aorta
+    anchor), and a suction cup is the same set sprung to a *moving* frame (the
+    cup body).  Both are compliant, both report a reaction force, and both can
+    let go under load.
+
+    Each attachment pulls its particle toward ``frame_o + att_ref[a]``, so the
+    attachment geometry is recorded once in frame coordinates and then rides
+    along with the frame -- no snap when the frame starts moving.
+
+    ``f_break`` is a per-attachment release threshold.  Checking it on-device
+    rather than in Python avoids a per-step readback and makes the failure
+    cascade emergent and correct: edge attachments stretch most, release
+    first, the survivors then carry more, and the grip peels off rather than
+    vanishing all at once.
+
+    The Newton-3rd-law reaction impulse is accumulated so a tool can be driven
+    by the force the tissue exerts back on it.
+    """
+    a = wp.tid()
+    if att_state[a] == 0:
+        return
+    p = att_p[a]
+    if fixed[p] != 0:
+        return
+
+    target = frame_o + att_ref[a]
+    f = att_k[a] * (target - x[p]) + att_c[a] * (frame_v - v[p])
+
+    if f_break > 0.0 and wp.length(f) > f_break:
+        att_state[a] = 0
+        return
+
+    wp.atomic_add(v, p, f * (dt / m_p[p]))
+    wp.atomic_add(reaction, 0, -f * dt)
+
+
+class AttachmentSet:
+    """A set of damped springs tying particles to a rigid frame.
+
+    Two instances of the same thing:
+
+    * **pedicle tether** -- hilar kidney particles sprung to a *static* frame
+      at the aorta.  Replaces a hard Dirichlet BC with something compliant, so
+      the organ can move and recoil instead of being nailed in place, and so
+      the tether force is observable (and can avulse).
+    * **suction cup** -- tumour-surface particles sprung to a *moving* frame
+      (the cup body).  Force-controlled, so it can slip or pop off.
+
+    Stiffness is specified as a total for the set and divided across
+    attachments, which keeps behaviour resolution-independent: refining the
+    particle lattice does not silently stiffen the tether.
+
+    Damping defaults to a fraction ``zeta`` of critical for each attachment's
+    own particle mass.
+
+    Stability: an explicit spring needs ``k_per < 2 m_p / dt^2``, and a clean
+    (non-ringing) response wants ``omega*dt < 0.2``, i.e. roughly
+    ``k_per < 0.04 m_p / dt^2``.  ``check_stability()`` reports both margins.
+    """
+
+    def __init__(self, sim, particle_idx, frame_origin_m, k_total,
+                 zeta=0.7, f_break_total=None, ref_positions=None):
+        """
+        Args:
+            sim:            the MPMSimulator to attach to.
+            particle_idx:   indices of the particles to attach.
+            frame_origin_m: the frame's world origin [m].  Attachment offsets
+                            are recorded relative to this, so the set rides
+                            with the frame without snapping.
+            k_total:        total stiffness of the set [N/m], divided evenly.
+            zeta:           damping ratio per attachment (0.7 = well damped).
+            f_break_total:  total force at which the set fully lets go [N].
+                            None = never releases.  Divided per attachment, so
+                            release is a peel rather than an all-at-once pop.
+            ref_positions:  attachment points in WORLD coordinates [m].
+                            Defaults to the particles' current positions,
+                            which is what you want when attaching to whatever
+                            the tissue is doing right now.  Pass rest
+                            positions to tether tissue to its rest shape.
+        """
+        self.sim = sim
+        idx = np.ascontiguousarray(np.asarray(particle_idx, dtype=np.int32).ravel())
+        if idx.size == 0:
+            raise ValueError("AttachmentSet needs at least one particle")
+        n = idx.size
+
+        pos = sim.x.numpy() if ref_positions is None else np.asarray(ref_positions,
+                                                                     dtype=np.float32)
+        if ref_positions is None:
+            ref_world = pos[idx]
+        else:
+            ref_world = pos if pos.shape[0] == n else pos[idx]
+
+        self._origin = np.asarray(frame_origin_m, dtype=np.float64).reshape(3)
+        ref_frame = (ref_world - self._origin).astype(np.float32)
+
+        m = sim.m_p.numpy()[idx].astype(np.float64)
+        k_per = float(k_total) / n
+        c_per = 2.0 * float(zeta) * np.sqrt(np.maximum(k_per * m, 0.0))
+
+        self.k_total = float(k_total)
+        self.zeta = float(zeta)
+        self.f_break = (float(f_break_total) / n) if f_break_total else 0.0
+        self._frame_v = np.zeros(3)
+        self._n0 = n
+
+        with wp.ScopedDevice(sim.device):
+            self.att_p = wp.array(idx, dtype=int)
+            self.att_ref = wp.array(np.ascontiguousarray(ref_frame), dtype=wp.vec3)
+            self.att_k = wp.array(np.full(n, k_per, dtype=np.float32), dtype=float)
+            self.att_c = wp.array(np.ascontiguousarray(c_per, dtype=np.float32),
+                                  dtype=float)
+            self.att_state = wp.array(np.ones(n, dtype=np.int32), dtype=int)
+            self._reaction = wp.zeros(1, dtype=wp.vec3)
+        self._last_impulse = np.zeros(3, dtype=np.float32)
+
+    # -- frame ---------------------------------------------------------------
+
+    def set_frame(self, origin_m, vel_m_s=None):
+        """Move the frame.  Attachments follow, dragging their particles."""
+        self._origin = np.asarray(origin_m, dtype=np.float64).reshape(3)
+        self._frame_v = (np.zeros(3) if vel_m_s is None
+                         else np.asarray(vel_m_s, dtype=np.float64).reshape(3))
+
+    @property
+    def frame_origin(self):
+        return self._origin.copy()
+
+    # -- state ---------------------------------------------------------------
+
+    @property
+    def n_attached(self):
+        """How many attachments are still holding."""
+        return int(self.att_state.numpy().sum())
+
+    @property
+    def n_total(self):
+        return self._n0
+
+    def release(self):
+        """Let go entirely."""
+        with wp.ScopedDevice(self.sim.device):
+            self.att_state = wp.zeros(self._n0, dtype=int)
+
+    @property
+    def reaction_impulse(self):
+        """Impulse applied to the frame over the last step [kg m/s]."""
+        return self._last_impulse.copy()
+
+    @property
+    def reaction_force(self):
+        """Force the tissue exerts on the frame, last step [N]."""
+        return self._last_impulse / float(self.sim.dt)
+
+    # -- diagnostics ---------------------------------------------------------
+
+    def check_stability(self):
+        """Return the explicit-integration margins for this set.
+
+        ``hard`` < 1 is required for stability at all; ``clean`` < 1 keeps the
+        spring from ringing at the timestep scale.
+        """
+        k_per = self.k_total / self._n0
+        m_min = float(self.sim.m_p.numpy()[self.att_p.numpy()].min())
+        dt = float(self.sim.dt)
+        return {
+            "k_per": k_per,
+            "k_hard_limit": 2.0 * m_min / dt ** 2,
+            "k_clean_limit": 0.04 * m_min / dt ** 2,
+            "hard": k_per / (2.0 * m_min / dt ** 2),
+            "clean": k_per / (0.04 * m_min / dt ** 2),
+        }
+
+    # -- called by MPMSimulator._step_core -----------------------------------
+
+    def _launch(self, dt):
+        self._reaction.zero_()
+        wp.launch(_apply_attachment_forces, dim=self._n0,
+                  inputs=[self.sim.x, self.sim.v, self.sim.fixed, self.sim.m_p,
+                          self.att_p, self.att_ref, self.att_k, self.att_c,
+                          self.att_state,
+                          wp.vec3(*[float(c) for c in self._origin]),
+                          wp.vec3(*[float(c) for c in self._frame_v]),
+                          float(self.f_break), float(dt), self._reaction])
+
+    def _read_reaction(self):
+        self._last_impulse = self._reaction.numpy()[0].copy()
+
+
 class MPMSimulator:
     """Explicit MLS-MPM simulator for a rectangular soft-tissue block.
 
@@ -1205,6 +1414,12 @@ class MPMSimulator:
         #: but not frictionless: ~0.15.
         self.obstacle_friction = 0.0
 
+        #: Attachment spring sets (AttachmentSet).  Launched by _step_core in
+        #: the pre-P2G position, so their force is scattered to the grid and
+        #: seen by the same step's stress update.  Used for the renal-pedicle
+        #: tether and the suction cup.
+        self.attachments = []
+
         #: Frictionless no-penetration floor at grid row j == 0.  On by
         #: default for backward compatibility.  Turn it off in scenarios that
         #: supply their own support surface, or the most-posterior grid plane
@@ -1267,6 +1482,8 @@ class MPMSimulator:
 
         n = len(positions)
         self.n_particles = n
+
+        self._warn_grid_margin(positions)
 
         vol_p  = float(step ** 3)
         mass_p = float(self.material.rho * vol_p)
@@ -1403,6 +1620,26 @@ class MPMSimulator:
     # Per-particle material
     # ------------------------------------------------------------------
 
+    def _warn_grid_margin(self, positions):
+        """Warn when particles reach the outermost grid cells.
+
+        P2G and G2P *skip* out-of-range nodes rather than clamping, so
+        momentum scattered beyond the grid is silently lost and G2P gathers a
+        reduced velocity.  The result reads as a mysterious drag that pins the
+        body in place -- easy to mistake for a physics result.  Keep at least
+        two cells of padding between the particles and block_lo/block_hi.
+        """
+        margin = 2.0 * self.dx
+        lo_edge = positions.min(axis=0) - self.block_lo
+        hi_edge = self.block_hi - positions.max(axis=0)
+        if (lo_edge < margin).any() or (hi_edge < margin).any():
+            print("MPMSimulator: WARNING particles come within 2*dx (%.1f mm) of "
+                  "the grid boundary; margins lo=%s mm hi=%s mm.  P2G/G2P drop "
+                  "out-of-range nodes, so the boundary acts as an artificial "
+                  "drag.  Enlarge block_lo/block_hi relative to the particles."
+                  % (margin * 1000,
+                     np.round(lo_edge * 1000, 1), np.round(hi_edge * 1000, 1)))
+
     def _ensure_material_arrays(self):
         """Allocate mu_p / lam_p / fiber_k if absent or stale.
 
@@ -1523,6 +1760,13 @@ class MPMSimulator:
             for hook in pre_p2g:
                 hook()
 
+            # Attachment springs are a SUSTAINED load, so they belong before
+            # P2G: applied after G2P they would be invisible to this step's
+            # stress update, which is exactly the mechanism that drives F
+            # drift (see the step_with_contact docstring).
+            for att in self.attachments:
+                att._launch(dt)
+
             # Total-Lagrangian: recompute F from current positions BEFORE P2G
             # so the stress uses a drift-free deformation gradient.
             if self.total_lagrangian and self.nbr_px is not None:
@@ -1623,6 +1867,9 @@ class MPMSimulator:
 
             for hook in post_forces:
                 hook()
+
+        for att in self.attachments:
+            att._read_reaction()
 
     def step(self, gravity=None):
         """Advance one explicit timestep."""

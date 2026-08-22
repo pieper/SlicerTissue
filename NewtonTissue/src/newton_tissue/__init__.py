@@ -41,7 +41,7 @@ from .materials import (
     NodalMaterial,
 )
 from .model import TissueModel
-from .mpm import MPMMaterial, MPMSimulator
+from .mpm import AttachmentSet, MPMMaterial, MPMSimulator
 from .results import SimulationResults
 from .solver import TissueSolver
 
@@ -62,6 +62,7 @@ __all__ = [
     "PROSTATE_TRANSITION",
     "MPMMaterial",
     "MPMSimulator",
+    "AttachmentSet",
     "BoundaryCondition",
     "FixedBC",
     "FixedByPredicate",
